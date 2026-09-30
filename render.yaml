@@ -1,0 +1,20 @@
+# Render Blueprint: New > Blueprint > pick this repo.
+# A persistent disk (needed for the SQLite database) requires a paid instance type.
+services:
+  - type: web
+    name: pharmacy-pos
+    runtime: docker
+    plan: starter
+    numInstances: 1          # SQLite: exactly one instance may own the database
+    healthCheckPath: /healthz
+    disk:
+      name: pharmacy-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SETUP_TOKEN
+        generateValue: true  # copy it from the Render dashboard to create the admin account
+      - key: TRUST_PROXY
+        value: "1"
+    domains:
+      - pharmacy.z88.tech

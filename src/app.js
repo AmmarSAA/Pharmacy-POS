@@ -18,6 +18,12 @@ const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
 export function createApp(db) {
   const app = express()
   app.disable('x-powered-by')
+  // Behind a reverse proxy / load balancer, set TRUST_PROXY to the number of proxy hops
+  // so client IPs (used for login rate limiting) are read correctly.
+  if (process.env.TRUST_PROXY) {
+    const v = process.env.TRUST_PROXY
+    app.set('trust proxy', /^\d+$/.test(v) ? Number(v) : v === 'true' ? true : v)
+  }
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -32,6 +38,11 @@ export function createApp(db) {
   )
   app.use(express.json({ limit: '1mb' }))
   app.use(cookieParser())
+
+  app.get('/healthz', (req, res) => {
+    db.prepare('SELECT 1').get()
+    res.json({ ok: true })
+  })
 
   const api = express.Router()
   api.use('/auth', authRoutes(db))

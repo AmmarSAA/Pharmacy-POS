@@ -58,6 +58,8 @@ npm run seed
 | `DB_PATH`       | `data/pharmacy.db`   | SQLite database file                                      |
 | `JWT_SECRET`    | generated and stored in the database | Signing key for sign-in sessions          |
 | `COOKIE_SECURE` | off                  | Set to `1` when serving over HTTPS                        |
+| `SETUP_TOKEN`   | none                 | If set, creating the first admin account requires this token. **Always set it on a public server.** |
+| `TRUST_PROXY`   | off                  | Number of reverse-proxy hops in front of the app, so login rate limiting sees real client IPs |
 
 Pharmacy name, address, licence numbers, default GST rate, expiry warning window, rounding and receipt
 footer are set in the app under **Settings**.
@@ -70,6 +72,37 @@ to a USB drive or cloud folder. For a consistent copy while the app is running:
 ```bash
 sqlite3 data/pharmacy.db ".backup 'backup-$(date +%F).db'"
 ```
+
+## Deploying online (pharmacy.z88.tech)
+
+The app needs one always-on server with a persistent disk, because the database is a file. Serverless
+hosts (Netlify Functions, Vercel, Cloudflare Workers) can't keep it. Run exactly **one** instance.
+
+### Option A: Render (click-through)
+
+1. In Render: **New → Blueprint**, pick this repository. `render.yaml` creates a Docker web service with
+   a 1 GB disk at `/data`, a health check, a random `SETUP_TOKEN`, and the custom domain `pharmacy.z88.tech`.
+   A persistent disk needs a paid instance (Starter).
+2. In Cloudflare DNS for `z88.tech`, add `CNAME pharmacy → <service>.onrender.com`, set to
+   **DNS only** (grey cloud) so Render can issue the TLS certificate.
+3. When Render shows the domain as verified, open https://pharmacy.z88.tech, paste the `SETUP_TOKEN`
+   value from the service's Environment tab, and create the owner account.
+
+### Option B: any VPS with Docker
+
+```bash
+docker build -t pharmacy-pos .
+docker run -d --name pharmacy-pos --restart unless-stopped \
+  -p 127.0.0.1:3000:3000 -v pharmacy-data:/data \
+  -e SETUP_TOKEN="$(openssl rand -hex 16)" -e TRUST_PROXY=1 \
+  pharmacy-pos
+docker inspect pharmacy-pos --format '{{range .Config.Env}}{{println .}}{{end}}' | grep SETUP_TOKEN
+```
+
+Put a TLS reverse proxy in front (Caddy: `pharmacy.z88.tech { reverse_proxy 127.0.0.1:3000 }`) and point an
+`A` record for `pharmacy` at the server. The image sets `COOKIE_SECURE=1`, so it must be served over HTTPS.
+
+Back up the `/data` volume daily. Patient names, CNICs and prescriptions are stored there.
 
 ## How money and tax work
 

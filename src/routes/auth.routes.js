@@ -1,21 +1,46 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
+import rateLimit from 'express-rate-limit'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { authenticate, signToken, COOKIE } from '../auth.js'
 import { HttpError, reqString } from '../lib/http.js'
 
 const cookieOpts = { httpOnly: true, sameSite: 'strict', secure: process.env.COOKIE_SECURE === '1', maxAge: 12 * 3600 * 1000 }
+
+// Slows password guessing: failed attempts per IP in a 15 minute window.
+const credentialLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  skipSuccessfulRequests: true,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { message: 'Too many attempts. Try again in 15 minutes.' },
+})
+
+const digest = (v) => createHash('sha256').update(String(v)).digest()
+
+// When SETUP_TOKEN is set (required on a public server), first-run setup must present it,
+// so a stranger cannot claim the admin account before the owner does.
+function checkSetupToken(given) {
+  const expected = process.env.SETUP_TOKEN
+  if (!expected) return
+  if (!given || !timingSafeEqual(digest(given), digest(expected))) {
+    throw new HttpError(403, 'Setup token is incorrect')
+  }
+}
 
 export default function authRoutes(db) {
   const r = Router()
   const userCount = () => db.prepare('SELECT COUNT(*) AS n FROM users').get().n
 
   r.get('/status', (req, res) => {
-    res.json({ needsSetup: userCount() === 0 })
+    res.json({ needsSetup: userCount() === 0, setupTokenRequired: Boolean(process.env.SETUP_TOKEN) })
   })
 
   // First run only: creates the owner/admin account.
-  r.post('/setup', (req, res) => {
+  r.post('/setup', credentialLimiter, (req, res) => {
     if (userCount() > 0) throw new HttpError(409, 'Setup has already been completed')
+    checkSetupToken(req.body.setup_token)
     const username = reqString(req.body, 'username', 'Username')
     const fullName = reqString(req.body, 'full_name', 'Full name')
     const password = reqString(req.body, 'password', 'Password')
@@ -29,7 +54,7 @@ export default function authRoutes(db) {
     res.cookie(COOKIE, signToken(db, user), cookieOpts).status(201).json({ user })
   })
 
-  r.post('/login', (req, res) => {
+  r.post('/login', credentialLimiter, (req, res) => {
     const username = reqString(req.body, 'username', 'Username')
     const password = reqString(req.body, 'password', 'Password')
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username)
@@ -46,7 +71,7 @@ export default function authRoutes(db) {
 
   r.get('/me', authenticate(db), (req, res) => res.json({ user: req.user }))
 
-  r.post('/change-password', authenticate(db), (req, res) => {
+  r.post('/change-password', credentialLimiter, authenticate(db), (req, res) => {
     const current = reqString(req.body, 'current_password', 'Current password')
     const next = reqString(req.body, 'new_password', 'New password')
     if (next.length < 8) throw new HttpError(400, 'New password must be at least 8 characters')

@@ -115,12 +115,13 @@ async function loadSettings() {
 }
 
 async function renderAuth() {
-  const { needsSetup } = await get('/auth/status').catch(() => ({ needsSetup: false }))
+  const { needsSetup, setupTokenRequired } = await get('/auth/status').catch(() => ({ needsSetup: false }))
   $('#modal-root').innerHTML = ''
   $('#app').innerHTML = needsSetup
     ? `<div class="auth"><form class="panel" id="auth-form">
         <h1>Set up your pharmacy</h1>
         <p class="muted">Create the owner (admin) account. You can add pharmacists and cashiers afterwards.</p>
+        ${setupTokenRequired ? '<label class="field">Setup token (from the server configuration)<input name="setup_token" type="password" required autocomplete="off"></label>' : ''}
         <label class="field">Pharmacy name<input name="pharmacy_name" required></label>
         <label class="field">Your full name<input name="full_name" required></label>
         <label class="field">Username<input name="username" required autocomplete="username"></label>
