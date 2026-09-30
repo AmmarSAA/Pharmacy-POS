@@ -18,7 +18,18 @@ const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
 export function createApp(db) {
   const app = express()
   app.disable('x-powered-by')
-  app.use(helmet({ contentSecurityPolicy: { directives: { 'script-src': ["'self'"] } } }))
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          'script-src': ["'self'"],
+          // Tills usually reach the server over plain http on the shop LAN.
+          'upgrade-insecure-requests': null,
+        },
+      },
+      strictTransportSecurity: false,
+    }),
+  )
   app.use(express.json({ limit: '1mb' }))
   app.use(cookieParser())
 
