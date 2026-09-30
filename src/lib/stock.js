@@ -18,7 +18,7 @@ export function moveStock(db, { batchId, change, reason, refId = null, userId, n
 export function allocateFefo(db, productId, qty, onDate) {
   const batches = db
     .prepare(
-      `SELECT id, batch_no, expiry_date, qty_on_hand, sale_price, cost_price
+      `SELECT id, batch_no, expiry_date, qty_on_hand, sale_price, cost_price, pack_price, pack_size
        FROM batches
        WHERE product_id = ? AND qty_on_hand > 0 AND expiry_date >= ?
        ORDER BY expiry_date, id`,

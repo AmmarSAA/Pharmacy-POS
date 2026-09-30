@@ -15,6 +15,9 @@ export function configureClock(utcOffsetMinutes) {
   clock.sqlModifier = `${m >= 0 ? '+' : '-'}${Math.abs(m)} minutes`
 }
 
+// SQL expression for the current pharmacy-local timestamp, e.g. SELECT ${sqlNow()} AS t
+export const sqlNow = () => `datetime('now', '${clock.sqlModifier}')`
+
 const schema = () => `
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,

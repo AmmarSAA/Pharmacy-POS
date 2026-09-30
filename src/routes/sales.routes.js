@@ -1,9 +1,10 @@
 import { Router } from 'express'
 import { requireRole } from '../auth.js'
 import { transaction, today, getSettings } from '../db.js'
-import { HttpError, badRequest, notFound, reqInt, reqString, optString, optDate, oneOf } from '../lib/http.js'
+import { HttpError, badRequest, notFound, reqInt, optInt, reqString, optString, optDate, oneOf } from '../lib/http.js'
 import { allocateFefo, moveStock } from '../lib/stock.js'
-import { percentOf, inclusiveTax, roundToRupee } from '../lib/money.js'
+import { percentOf, inclusiveTax, roundToRupee, packAmount } from '../lib/money.js'
+import { tillForCash } from '../lib/till.js'
 
 const PAYMENT_METHODS = ['cash', 'card', 'wallet']
 const MAX_DISCOUNT_BPS = { cashier: 1000, pharmacist: 2500, admin: 10000 }
@@ -53,8 +54,9 @@ export function loadSale(db, id) {
 export default function saleRoutes(db) {
   const r = Router()
 
-  // Body: { items: [{ product_id, qty, discount_bps }], payment_method, amount_paid,
+  // Body: { items: [{ product_id, packs?, loose?, qty?, discount_bps }], payment_method, amount_paid,
   //         customer_name?, customer_phone?, prescription? }
+  // Units per line = qty if given, else packs * pack_size + loose.
   r.post('/', (req, res) => {
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('The cart is empty')
@@ -65,21 +67,34 @@ export default function saleRoutes(db) {
     // Merge duplicate lines for the same product so FEFO allocation sees the full quantity.
     const cart = new Map()
     for (const [i, it] of items.entries()) {
-      const productId = reqInt(it, 'product_id', { min: 1, label: `Item ${i + 1}: product` })
-      const qty = reqInt(it, 'qty', { min: 1, max: 100000, label: `Item ${i + 1}: quantity` })
-      const discountBps = reqInt({ v: it.discount_bps ?? 0 }, 'v', { min: 0, max: 10000, label: `Item ${i + 1}: discount` })
+      const label = `Item ${i + 1}`
+      const productId = reqInt(it, 'product_id', { min: 1, label: `${label}: product` })
+      const p = db.prepare('SELECT * FROM products WHERE id = ?').get(productId)
+      if (!p || !p.active) throw badRequest(`Product ${productId} is not available`)
+      const packSize = p.pack_size || 1
+      let qty
+      if (it.qty !== undefined && it.qty !== null && it.qty !== '') {
+        qty = reqInt(it, 'qty', { min: 1, max: 100000, label: `${label}: quantity` })
+      } else {
+        const packs = optInt(it, 'packs', 0, { min: 0, max: 100000, label: `${label}: packs` })
+        const loose = optInt(it, 'loose', 0, { min: 0, max: 100000, label: `${label}: loose units` })
+        qty = packs * packSize + loose
+        if (qty < 1) throw badRequest(`${label}: quantity must be at least 1`)
+        if (qty > 100000) throw badRequest(`${label}: quantity must be between 1 and 100000`)
+      }
+      if (!p.allow_loose && qty % packSize !== 0) {
+        throw badRequest(`${p.name} is sold in full packs of ${packSize} only`)
+      }
+      const discountBps = reqInt({ v: it.discount_bps ?? 0 }, 'v', { min: 0, max: 10000, label: `${label}: discount` })
       if (discountBps > maxDiscount) {
         throw new HttpError(403, `Your role can give at most ${maxDiscount / 100}% discount`)
       }
       const prev = cart.get(productId)
-      cart.set(productId, { productId, qty: (prev?.qty || 0) + qty, discountBps: Math.max(prev?.discountBps || 0, discountBps) })
+      cart.set(productId, {
+        productId, product: p, qty: (prev?.qty || 0) + qty, discountBps: Math.max(prev?.discountBps || 0, discountBps),
+      })
     }
-
-    const products = [...cart.values()].map((line) => {
-      const p = db.prepare('SELECT * FROM products WHERE id = ?').get(line.productId)
-      if (!p || !p.active) throw badRequest(`Product ${line.productId} is not available`)
-      return { ...line, product: p }
-    })
+    const products = [...cart.values()]
 
     const hasRx = products.some((l) => l.product.schedule !== 'otc')
     const hasControlled = products.some((l) => l.product.schedule === 'controlled')
@@ -88,6 +103,7 @@ export default function saleRoutes(db) {
     }
     const prescription = hasRx ? readPrescription(req.body, hasControlled) : null
     const settings = getSettings(db)
+    const till = tillForCash(db, req.user.id, settings, 'sell')
 
     const sale = transaction(db, () => {
       // Allocate stock and price every batch slice.
@@ -98,7 +114,8 @@ export default function saleRoutes(db) {
           throw new HttpError(409, `Not enough stock for ${l.product.name}: ${available} available`)
         }
         for (const { batch, qty } of picks) {
-          const gross = batch.sale_price * qty
+          const packSize = batch.pack_size ?? 1
+          const gross = packAmount(qty, batch.pack_price ?? batch.sale_price * packSize, packSize)
           const discount = percentOf(gross, l.discountBps)
           const net = gross - discount
           lines.push({
@@ -137,23 +154,24 @@ export default function saleRoutes(db) {
       const saleId = Number(
         db.prepare(
           `INSERT INTO sales (invoice_no, user_id, customer_name, customer_phone, prescription_id, subtotal, discount, tax,
-             round_off, total, payment_method, amount_paid, change_due)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             round_off, total, payment_method, amount_paid, change_due, till_session_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           invoiceNo, req.user.id,
           optString(req.body, 'customer_name') || prescription?.patient_name || null,
           optString(req.body, 'customer_phone') || prescription?.patient_phone || null,
           prescriptionId, subtotal, discount, tax, roundOff, total, paymentMethod, amountPaid, amountPaid - total,
+          till?.id ?? null,
         ).lastInsertRowid,
       )
 
       const insertItem = db.prepare(
         `INSERT INTO sale_items (sale_id, product_id, batch_id, qty, unit_price, unit_cost, discount_bps, discount,
-           gst_rate_bps, tax, line_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           gst_rate_bps, tax, line_total, pack_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       for (const l of lines) {
         insertItem.run(saleId, l.product.id, l.batch.id, l.qty, l.batch.sale_price, l.batch.cost_price, l.discountBps,
-          l.discount, l.product.gst_rate_bps, l.tax, l.net)
+          l.discount, l.product.gst_rate_bps, l.tax, l.net, l.product.pack_size || 1)
         moveStock(db, { batchId: l.batch.id, change: -l.qty, reason: 'sale', refId: saleId, userId: req.user.id })
       }
       return saleId
@@ -207,6 +225,7 @@ export default function saleRoutes(db) {
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('Choose at least one item to return')
     const reason = reqString(req.body, 'reason', 'Reason')
+    const till = tillForCash(db, req.user.id, getSettings(db), 'refund')
 
     transaction(db, () => {
       const lines = items.map((it, i) => {
@@ -222,8 +241,8 @@ export default function saleRoutes(db) {
       })
       const refundTotal = lines.reduce((s, l) => s + l.amount, 0)
       const returnId = Number(
-        db.prepare('INSERT INTO returns (sale_id, user_id, reason, refund_total) VALUES (?, ?, ?, ?)')
-          .run(saleId, req.user.id, reason, refundTotal).lastInsertRowid,
+        db.prepare('INSERT INTO returns (sale_id, user_id, reason, refund_total, till_session_id) VALUES (?, ?, ?, ?, ?)')
+          .run(saleId, req.user.id, reason, refundTotal, till?.id ?? null).lastInsertRowid,
       )
       for (const l of lines) {
         db.prepare('INSERT INTO return_items (return_id, sale_item_id, qty, amount, tax, restocked) VALUES (?, ?, ?, ?, ?, ?)')

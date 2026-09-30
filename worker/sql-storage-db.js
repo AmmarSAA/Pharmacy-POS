@@ -40,7 +40,9 @@ export class SqlStorageDb {
     const { sql, names } = compile(source)
     const bind = (args) => {
       const first = args[0]
-      if (names.length && first && typeof first === 'object' && !Array.isArray(first)) {
+      // An object argument carries named parameters (node:sqlite style); with no :names in the
+      // SQL it binds nothing, rather than being passed through as a value.
+      if (first && typeof first === 'object' && !Array.isArray(first)) {
         return names.map((n) => toSql(first[n]))
       }
       return args.map(toSql)

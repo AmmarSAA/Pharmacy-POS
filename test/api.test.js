@@ -56,6 +56,15 @@ test('admin creates staff; cashier cannot manage users', async () => {
   assert.equal((await call('GET', '/users', null, 'cashier')).status, 403)
 })
 
+// Selling and refunding need an open till (setting require_open_till = '1' by default).
+test('staff open their tills', async () => {
+  for (const as of ['admin', 'cashier', 'pharmacist']) {
+    const r = await call('POST', '/tills/open', { opening_cash: 0 }, as)
+    assert.equal(r.status, 201, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'open')
+  }
+})
+
 test('catalogue and purchase receiving create batches', async () => {
   const mk = (name, schedule, gst = 0, barcode) =>
     call('POST', '/products', { name, schedule, sale_price: 250, gst_rate_bps: gst, reorder_level: 50, barcode })

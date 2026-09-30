@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { requireRole } from '../auth.js'
 import { today, getSettings } from '../db.js'
+import { supplierDues } from '../lib/supplier-ledger.js'
 
 function range(req) {
   const from = req.query.from || today()
@@ -146,6 +147,15 @@ export default function reportRoutes(db) {
          ORDER BY b.expiry_date`,
       ).all({ today: today(), window: `+${days} days` }),
     )
+  })
+
+  // Supplier dues with ageing by days past due. Payments settle the oldest bills first.
+  // ?owing=1 leaves out suppliers with a zero balance.
+  r.get('/supplier-dues', (req, res) => {
+    const rows = [...supplierDues(db).values()]
+      .filter((d) => req.query.owing !== '1' || d.balance !== 0)
+      .sort((a, b) => b.overdue - a.overdue || b.balance - a.balance || a.name.localeCompare(b.name))
+    res.json(rows)
   })
 
   return r
