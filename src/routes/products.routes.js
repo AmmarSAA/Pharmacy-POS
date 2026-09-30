@@ -1,7 +1,8 @@
 import { Router } from 'express'
 import { requireRole } from '../auth.js'
 import { today, getSettings } from '../db.js'
-import { HttpError, notFound, reqString, optString, reqInt, optInt, oneOf } from '../lib/http.js'
+import { transaction } from '../db.js'
+import { HttpError, badRequest, notFound, reqString, optString, reqInt, optInt, oneOf } from '../lib/http.js'
 
 export const SCHEDULES = ['otc', 'rx', 'controlled']
 
@@ -11,26 +12,53 @@ const STOCK_SQL = `
     COALESCE((SELECT SUM(qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.expiry_date >= :today), 0) AS stock,
     (SELECT MIN(expiry_date) FROM batches b WHERE b.product_id = p.id AND b.qty_on_hand > 0 AND b.expiry_date >= :today) AS next_expiry,
     (SELECT sale_price FROM batches b WHERE b.product_id = p.id AND b.qty_on_hand > 0 AND b.expiry_date >= :today
-       ORDER BY expiry_date, id LIMIT 1) AS current_price
+       ORDER BY expiry_date, id LIMIT 1) AS current_price,
+    (SELECT pack_price FROM batches b WHERE b.product_id = p.id AND b.qty_on_hand > 0 AND b.expiry_date >= :today
+       ORDER BY expiry_date, id LIMIT 1) AS current_pack_price
   FROM products p`
 
+const COLUMNS = ['name', 'generic_name', 'barcode', 'manufacturer', 'form', 'strength', 'category', 'pack_size',
+  'schedule', 'gst_rate_bps', 'reorder_level', 'sale_price', 'pack_price', 'packing', 'allow_loose', 'shelf_location', 'active']
+
+// Accepts the pack price (preferred) or the per-unit price and keeps both in step.
+function prices(body, packSize) {
+  if (body.pack_price !== undefined && body.pack_price !== null && body.pack_price !== '') {
+    const packPrice = reqInt(body, 'pack_price', { min: 0, label: 'Pack price' })
+    return { pack_price: packPrice, sale_price: Math.round(packPrice / packSize) }
+  }
+  const unit = reqInt(body, 'sale_price', { min: 0, label: 'Sale price' })
+  return { pack_price: unit * packSize, sale_price: unit }
+}
+
 function readProduct(body, defaults) {
-  const barcode = optString(body, 'barcode')
+  const packSize = optInt(body, 'pack_size', 1, { min: 1, max: 100000, label: 'Units per pack' })
   return {
     name: reqString(body, 'name', 'Name'),
     generic_name: optString(body, 'generic_name'),
-    barcode,
+    barcode: optString(body, 'barcode'),
     manufacturer: optString(body, 'manufacturer'),
     form: optString(body, 'form'),
     strength: optString(body, 'strength'),
     category: optString(body, 'category'),
-    pack_size: optInt(body, 'pack_size', 1, { min: 1, label: 'Pack size' }),
+    pack_size: packSize,
     schedule: oneOf(body.schedule || 'otc', SCHEDULES, 'Schedule'),
     gst_rate_bps: optInt(body, 'gst_rate_bps', defaults.gst, { min: 0, max: 10000, label: 'GST rate' }),
     reorder_level: optInt(body, 'reorder_level', 0, { min: 0, label: 'Reorder level' }),
-    sale_price: reqInt(body, 'sale_price', { min: 0, label: 'Sale price' }),
+    ...prices(body, packSize),
+    packing: optString(body, 'packing'),
+    allow_loose: body.allow_loose === undefined ? 1 : body.allow_loose ? 1 : 0,
+    shelf_location: optString(body, 'shelf_location'),
     active: body.active === undefined ? 1 : body.active ? 1 : 0,
   }
+}
+
+// Import rows use MultiTec-style loose data: only name is required.
+function readImportRow(row, defaults) {
+  const clean = { ...row }
+  for (const k of Object.keys(clean)) if (typeof clean[k] === 'string') clean[k] = clean[k].trim()
+  if (clean.pack_price === undefined && clean.sale_price === undefined) clean.pack_price = 0
+  if (clean.schedule) clean.schedule = String(clean.schedule).toLowerCase()
+  return readProduct(clean, defaults)
 }
 
 export default function productRoutes(db) {
@@ -78,17 +106,13 @@ export default function productRoutes(db) {
     }
   }
 
+  const insert = (p) =>
+    db.prepare(`INSERT INTO products (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map((c) => ':' + c).join(', ')})`).run(p)
+
   r.post('/', requireRole('admin', 'pharmacist'), (req, res) => {
     const p = readProduct(req.body, defaults())
     assertBarcodeFree(p.barcode)
-    const { lastInsertRowid } = db
-      .prepare(
-        `INSERT INTO products (name, generic_name, barcode, manufacturer, form, strength, category, pack_size,
-           schedule, gst_rate_bps, reorder_level, sale_price, active)
-         VALUES (:name, :generic_name, :barcode, :manufacturer, :form, :strength, :category, :pack_size,
-           :schedule, :gst_rate_bps, :reorder_level, :sale_price, :active)`,
-      )
-      .run(p)
+    const { lastInsertRowid } = insert(p)
     res.status(201).json(db.prepare('SELECT * FROM products WHERE id = ?').get(lastInsertRowid))
   })
 
@@ -97,13 +121,49 @@ export default function productRoutes(db) {
     if (!db.prepare('SELECT 1 FROM products WHERE id = ?').get(id)) throw notFound('Product')
     const p = readProduct(req.body, defaults())
     assertBarcodeFree(p.barcode, id)
-    db.prepare(
-      `UPDATE products SET name = :name, generic_name = :generic_name, barcode = :barcode, manufacturer = :manufacturer,
-         form = :form, strength = :strength, category = :category, pack_size = :pack_size, schedule = :schedule,
-         gst_rate_bps = :gst_rate_bps, reorder_level = :reorder_level, sale_price = :sale_price, active = :active
-       WHERE id = :id`,
-    ).run({ ...p, id })
+    db.prepare(`UPDATE products SET ${COLUMNS.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id`).run({ ...p, id })
     res.json(db.prepare('SELECT * FROM products WHERE id = ?').get(id))
+  })
+
+  // Bulk import from an item list (e.g. MultiTec export). Matches existing items by barcode/item
+  // code, otherwise by exact name; updates them, creates the rest. Bad rows are reported, not fatal.
+  r.post('/import', requireRole('admin', 'pharmacist'), (req, res) => {
+    const rows = req.body.rows
+    if (!Array.isArray(rows) || rows.length === 0) throw badRequest('No rows to import')
+    if (rows.length > 2000) throw badRequest('Import at most 2000 rows at a time')
+    const d = defaults()
+    const result = { created: 0, updated: 0, errors: [] }
+    transaction(db, () => {
+      rows.forEach((row, i) => {
+        let p
+        try {
+          p = readImportRow(row, d)
+        } catch (err) {
+          result.errors.push({ row: i + 1, message: err.message })
+          return
+        }
+        const existing =
+          (p.barcode && db.prepare('SELECT * FROM products WHERE barcode = ?').get(p.barcode)) ||
+          (!p.barcode && db.prepare('SELECT * FROM products WHERE name = ? COLLATE NOCASE').get(p.name))
+        if (existing) {
+          // Only overwrite what the file actually carries (e.g. keep a price set in the app).
+          const has = (k) => row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== ''
+          const merged = { ...existing }
+          for (const c of COLUMNS) if (has(c)) merged[c] = p[c]
+          if (has('pack_price') || has('sale_price') || has('pack_size')) {
+            merged.pack_price = has('pack_price') || has('sale_price') ? p.pack_price : existing.pack_price
+            merged.sale_price = Math.round(merged.pack_price / merged.pack_size)
+          }
+          db.prepare(`UPDATE products SET ${COLUMNS.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id`)
+            .run(Object.fromEntries([...COLUMNS.map((c) => [c, merged[c]]), ['id', existing.id]]))
+          result.updated++
+        } else {
+          insert(p)
+          result.created++
+        }
+      })
+    })
+    res.json(result)
   })
 
   return r

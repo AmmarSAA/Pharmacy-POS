@@ -175,6 +175,59 @@ CREATE TABLE IF NOT EXISTS stock_movements (
   created_at TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 CREATE INDEX IF NOT EXISTS idx_movements_product ON stock_movements(product_id, created_at);
+
+-- Money paid to suppliers (and the automatic payment recorded for a cash purchase).
+CREATE TABLE IF NOT EXISTS supplier_payments (
+  id               INTEGER PRIMARY KEY,
+  supplier_id      INTEGER NOT NULL REFERENCES suppliers(id),
+  amount           INTEGER NOT NULL CHECK (amount > 0),
+  method           TEXT NOT NULL CHECK (method IN ('cash', 'bank', 'cheque', 'till')),
+  reference        TEXT,               -- cheque / transfer number
+  paid_on          TEXT NOT NULL,      -- YYYY-MM-DD
+  purchase_id      INTEGER REFERENCES purchases(id),
+  till_session_id  INTEGER REFERENCES till_sessions(id),
+  note             TEXT,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  created_at       TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
+);
+CREATE INDEX IF NOT EXISTS idx_supplier_payments ON supplier_payments(supplier_id, paid_on);
+
+-- A cashier's shift at the counter: opening float, cash in/out, counted cash at close.
+CREATE TABLE IF NOT EXISTS till_sessions (
+  id               INTEGER PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  business_date    TEXT NOT NULL,      -- YYYY-MM-DD the till was opened for
+  opening_cash     INTEGER NOT NULL DEFAULT 0,
+  opening_notes    TEXT,               -- JSON { "5000": 1, "1000": 3, ... }
+  opened_at        TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}')),
+  closed_at        TEXT,
+  expected_cash    INTEGER,
+  counted_cash     INTEGER,
+  closing_notes    TEXT,
+  close_note       TEXT,
+  status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed'))
+);
+CREATE INDEX IF NOT EXISTS idx_till_sessions_user ON till_sessions(user_id, status);
+
+CREATE TABLE IF NOT EXISTS cash_movements (
+  id               INTEGER PRIMARY KEY,
+  till_session_id  INTEGER NOT NULL REFERENCES till_sessions(id),
+  direction        TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+  amount           INTEGER NOT NULL CHECK (amount > 0),
+  reason           TEXT NOT NULL,
+  notes            TEXT,               -- JSON note count, optional
+  supplier_payment_id INTEGER REFERENCES supplier_payments(id),
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  created_at       TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
+);
+
+CREATE TABLE IF NOT EXISTS day_closes (
+  id               INTEGER PRIMARY KEY,
+  business_date    TEXT NOT NULL UNIQUE,
+  summary          TEXT NOT NULL,      -- JSON snapshot of the day's figures
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  created_at       TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
+);
 `
 
 const DEFAULT_SETTINGS = {
@@ -187,12 +240,81 @@ const DEFAULT_SETTINGS = {
   default_gst_rate_bps: '0',
   near_expiry_days: '90',
   round_to_rupee: '1',
+  default_margin_bps: '1500',
+  require_open_till: '1',
+  default_sale_unit: 'pack',
+  cash_denominations: '5000,1000,500,100,50,20,10,5,2,1',
   receipt_footer: 'Medicines once sold can be returned within 7 days with receipt, if unopened and stored properly.',
 }
 
-// Creates tables and default settings if they don't exist. Safe to run on every start.
+// Columns added after the first release. Applied to new and existing databases alike, so a
+// fresh install and an upgraded live database end up with the same shape.
+const ADDED_COLUMNS = {
+  products: {
+    pack_price: 'INTEGER',                       // price of one full pack, tax inclusive
+    packing: 'TEXT',                             // Strip, Box, Bottle ...
+    allow_loose: 'INTEGER NOT NULL DEFAULT 1',   // may be sold by single unit
+    shelf_location: 'TEXT',
+  },
+  batches: {
+    pack_price: 'INTEGER',                       // MRP per pack for this batch
+    pack_size: 'INTEGER',                        // units per pack when the batch was received
+  },
+  suppliers: {
+    due_days: 'INTEGER NOT NULL DEFAULT 0',      // credit terms
+    opening_balance: 'INTEGER NOT NULL DEFAULT 0', // owed before using this system
+    opening_date: 'TEXT',
+    contact_person: 'TEXT',
+    email: 'TEXT',
+    active: 'INTEGER NOT NULL DEFAULT 1',
+  },
+  purchases: {
+    payment_type: "TEXT NOT NULL DEFAULT 'credit'",
+    due_date: 'TEXT',
+    gross: 'INTEGER NOT NULL DEFAULT 0',
+    discount: 'INTEGER NOT NULL DEFAULT 0',
+  },
+  purchase_items: {
+    packs: 'INTEGER',
+    loose_qty: 'INTEGER NOT NULL DEFAULT 0',
+    bonus_qty: 'INTEGER NOT NULL DEFAULT 0',
+    pack_cost: 'INTEGER',
+    discount_bps: 'INTEGER NOT NULL DEFAULT 0',
+    pack_price: 'INTEGER',
+  },
+  sale_items: {
+    pack_size: 'INTEGER NOT NULL DEFAULT 1',
+  },
+  sales: {
+    till_session_id: 'INTEGER',
+  },
+  returns: {
+    till_session_id: 'INTEGER',
+  },
+}
+
+function columnsOf(db, table) {
+  return new Set(db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all().map((r) => r.name))
+}
+
+function migrate(db) {
+  for (const [table, cols] of Object.entries(ADDED_COLUMNS)) {
+    const have = columnsOf(db, table)
+    for (const [col, ddl] of Object.entries(cols)) {
+      if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`)
+    }
+  }
+  // Pack prices for rows created before pack pricing existed.
+  db.exec(`UPDATE products SET pack_price = sale_price * pack_size WHERE pack_price IS NULL`)
+  db.exec(`UPDATE batches SET pack_size = COALESCE((SELECT pack_size FROM products p WHERE p.id = batches.product_id), 1)
+           WHERE pack_size IS NULL`)
+  db.exec(`UPDATE batches SET pack_price = sale_price * pack_size WHERE pack_price IS NULL`)
+}
+
+// Creates tables and default settings if they don't exist, then migrates. Safe on every start.
 export function initDb(db) {
   db.exec(schema())
+  migrate(db)
   const insert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
   for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) insert.run(k, v)
   return db
