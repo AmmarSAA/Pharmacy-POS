@@ -27,6 +27,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); }
 button, input, select, textarea { font: inherit; color: inherit; }
 input, select, textarea {
@@ -143,4 +144,45 @@ td input { width: 80px; padding: 4px 6px; }
   #print-area { display: block; position: absolute; left: 0; top: 0; width: 100%; }
   #print-area.report { padding: 12mm; }
   #print-area.report table { font-size: 11px; }
+}
+
+/* MultiTec parity: till, packs, purchase grid, ledgers */
+a.link { color: var(--accent); text-decoration: none; }
+a.link:hover { text-decoration: underline; }
+tfoot td { font-weight: 700; border-top: 2px solid var(--border); border-bottom: none; }
+tr.overdue td { background: var(--danger-soft); }
+tr.overdue td b { color: var(--danger); }
+.banner { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  padding: 12px 14px; border-radius: var(--radius); background: var(--warn-soft); color: var(--warn); border: 1px solid var(--warn); }
+.banner b { color: inherit; }
+.till-status { font-size: 13px; padding: 0 2px; }
+.till-status a { color: var(--accent); }
+td input.qty { width: 64px; }
+.cart-table td { vertical-align: top; }
+
+.notes-grid { display: grid; gap: 6px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.note-row { display: grid; grid-template-columns: 90px 70px 1fr; gap: 8px; align-items: center; font-size: 14px; }
+.note-row input { width: 100%; padding: 5px 7px; text-align: right; }
+.note-row span:last-child { font-size: 12px; }
+.note-total { grid-column: 1 / -1; display: flex; justify-content: space-between; border-top: 1px solid var(--border);
+  padding-top: 8px; font-size: 18px; }
+
+.modal.xl { max-width: 1400px; }
+.purchase-grid td { padding: 3px 2px; }
+.purchase-grid th { padding: 6px 2px; font-size: 10px; line-height: 1.2; vertical-align: bottom; }
+.purchase-grid td input { padding: 4px 5px; }
+.purchase-grid input.w-prod { width: 200px; }
+.purchase-grid input.w-batch { width: 80px; }
+.purchase-grid input.w-date { width: 128px; }
+.purchase-grid input.w-n { width: 52px; text-align: right; }
+.purchase-grid input.w-money { width: 76px; text-align: right; }
+.purchase-grid input:disabled { background: var(--bg); }
+.purchase-foot { display: flex; flex-wrap: wrap; gap: 6px 18px; justify-content: flex-end; padding: 10px 4px;
+  border-top: 1px solid var(--border); font-size: 14px; font-variant-numeric: tabular-nums; }
+.purchase-foot .grand { font-size: 17px; }
+table.dues a { color: var(--accent); text-decoration: none; }
+@media (max-width: 600px) {
+  .modal-bg { padding: 12px 8px; }
+  .modal { padding: 14px; }
+  .note-row { grid-template-columns: 80px 64px 1fr; }
 }

@@ -71,15 +71,27 @@ export default function productRoutes(db) {
     const params = { today: today() }
     if (!req.query.all) where.push('p.active = 1')
     if (q) {
-      where.push('(p.name LIKE :q OR p.generic_name LIKE :q OR p.barcode = :exact)')
+      // Item codes (MultiTec ph1234) match by prefix, so "ph51" finds ph5152.
+      where.push('(p.name LIKE :q OR p.generic_name LIKE :q OR p.barcode LIKE :prefix)')
       params.q = `%${q}%`
-      params.exact = q
+      params.prefix = `${q}%`
     }
-    const limit = Math.min(Number(req.query.limit) || 50, 500)
+    // Large limits are for pick lists (purchase grid); a hospital pharmacy stocks several thousand items.
+    const limit = Math.min(Number(req.query.limit) || 50, 20000)
     const sql = `${STOCK_SQL} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY (p.barcode = :exact2) DESC, p.name LIMIT ${limit}`
     params.exact2 = q || null
     res.json(db.prepare(sql).all(params))
+  })
+
+  // Lightweight list for pick lists (purchase grid): no stock figures, only what a line needs.
+  r.get('/pick', (req, res) => {
+    res.json(
+      db.prepare(
+        `SELECT id, name, strength, form, barcode, pack_size, pack_price, sale_price, allow_loose, packing, active
+         FROM products ${req.query.all ? '' : 'WHERE active = 1'} ORDER BY name`,
+      ).all(),
+    )
   })
 
   // Exact barcode match, used by scanners.

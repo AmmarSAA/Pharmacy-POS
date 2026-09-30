@@ -51,10 +51,46 @@ Work proceeds on the defaults below; each is a setting or small change if the an
 
 ## Phase 4: test (by the user)
 
-Checklist at the end of this file, filled in after deployment.
+See the checklist below.
 
 ## Later (not in this round)
 
 Department issues/requisitions, purchase returns to supplier, purchase orders, double-entry
 accounting (trial balance, income statement), barcode label printing, multiple godowns,
 full data migration from the MultiTec database.
+
+## Status
+
+- Phase 2 done: built in three parallel workstreams (suppliers/purchases, sales/tills, UI) against
+  `docs/API-CONTRACT.md`, integrated and reviewed.
+- Phase 3 done:
+  - 52 automated tests on Node (unit, API, migration, workflow); API and workflow suites also pass
+    on the Cloudflare runtime (`wrangler dev`).
+  - Old-schema database upgraded in place on both runtimes.
+  - Browser walkthrough of every new screen at desktop and phone width; no console errors;
+    item names with HTML are shown as text.
+  - Scale: 6,000 imported items; purchase grid opens in about 0.3 s, search in about 10 ms.
+
+## Phase 4 checklist (for the pharmacy)
+
+Sign in at https://pharmacy.z88.tech as the owner, then:
+
+1. **Settings**: check pharmacy details, default margin (15%), "every sale needs an open till",
+   default sale unit (pack) and the note denominations.
+2. **Import items**: Products → Import items → paste the item sheet from Excel (e.g. `waqasBook1.xlsx`)
+   → check the preview → Import. Spot-check a few items' units per pack.
+3. **Suppliers**: add the suppliers from `Book4.xlsx` with their credit days and what is owed today
+   as the opening balance. The dues report total should match the sheet's outstanding (about Rs 826,165).
+4. **Purchase**: enter one real supplier bill in packs (with a bonus and a discount if it has one).
+   Check net cost, sale price, margin and the due date against the paper bill.
+5. **Till**: open the till with a note count → sell a full pack and some loose tablets → do a return
+   → a cash out → close with a real count. Expected cash should match the drawer.
+6. **Day close** after all tills are closed; print the summary.
+7. **Supplier payment**: record a payment (bank or cheque, and one from the till); check the ledger
+   and dues report.
+8. **Staff**: add a cashier account and confirm they can sell but can't see purchases or suppliers.
+
+Tell us about anything that differs from how MultiTec did it, especially:
+- Refunds are always paid in cash from the drawer (also for card sales). Should card refunds go back to the card?
+- An opening balance counts as due on its opening date (so it may show as overdue straight away).
+- Do wards or departments draw stock from the pharmacy? (MultiTec "Issue" — not built yet.)

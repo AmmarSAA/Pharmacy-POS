@@ -26,6 +26,16 @@ on the shop network open it in a browser. No internet connection or cloud databa
 - Controlled drugs also require the patient's CNIC and the prescriber's PMDC number, and only a pharmacist or admin can sell them
 - Controlled-drug register report: every receipt, sale and adjustment with running balance, patient, prescriber and supplier, printable
 
+**Packs, tills and supplier credit** (MultiTec parity, see `docs/PLAN.md`)
+- Items have units per pack and a pack price; the POS sells packs and loose units, priced exactly per pack
+- Tills: open with a note count, cash in/out, close with expected vs counted cash, then day close;
+  sales and refunds go through the cashier's open till (can be switched off in Settings)
+- Purchases entered in packs with loose units, bonus and trade discount; margin and mark-up per line;
+  missing sale prices default to cost + 15% margin; credit purchases get a due date from the supplier's terms
+- Supplier credit: opening balances, payments (cash, bank, cheque or from the till), ledger with
+  running balance, and a dues report with aging buckets and overdue bills
+- Import the item list by pasting from Excel or a CSV; MultiTec column names are recognised
+
 **Purchasing, users & reports**
 - Suppliers (with NTN and drug licence number) and stock receiving against supplier invoices, including bonus units
 - Roles: **cashier** (sell, own sales only), **pharmacist** (plus controlled drugs, returns, stock, purchases, reports), **admin** (plus users and settings)
@@ -130,6 +140,7 @@ Back up the `/data` volume daily. Patient names, CNICs and prescriptions are sto
 ```bash
 npm run dev    # restart on file changes
 npm test       # API tests against an in-memory database
+TEST_BASE_URL=http://localhost:8787 node --test test/workflow.test.js   # same checks against a running server
 ```
 
 - `src/` — Express API (`routes/`), database schema (`db.js`), stock/FEFO logic (`lib/stock.js`)
