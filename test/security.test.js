@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db.js'
+import { openDb } from '../src/db-node.js'
 import { createApp } from '../src/app.js'
 
 let server, base

@@ -1,3 +1,5 @@
 node_modules/
 data/
 .env
+worker/static-files.gen.js
+.wrangler/

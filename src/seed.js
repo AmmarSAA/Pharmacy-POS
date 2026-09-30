@@ -1,6 +1,7 @@
 // Loads demo suppliers, products and stock into an empty database, for trying the app out.
 // Run after creating the admin account: npm run seed
-import { openDb, transaction } from './db.js'
+import { transaction } from './db.js'
+import { openDb } from './db-node.js'
 import { moveStock } from './lib/stock.js'
 
 const db = openDb()

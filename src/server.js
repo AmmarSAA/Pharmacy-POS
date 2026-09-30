@@ -1,4 +1,4 @@
-import { openDb } from './db.js'
+import { openDb } from './db-node.js'
 import { createApp } from './app.js'
 
 const port = Number(process.env.PORT) || 3000

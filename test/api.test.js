@@ -1,18 +1,24 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db.js'
+import { openDb } from '../src/db-node.js'
 import { createApp } from '../src/app.js'
 
 let server, base
 const tokens = {}
 
+// TEST_BASE_URL runs the same checks against a running server with an empty database
+// (e.g. `npx wrangler dev` for the Cloudflare build).
 before(async () => {
+  if (process.env.TEST_BASE_URL) {
+    base = `${process.env.TEST_BASE_URL}/api`
+    return
+  }
   const db = openDb(':memory:')
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server.close())
+after(() => server?.close())
 
 async function call(method, path, body, as = 'admin') {
   const res = await fetch(base + path, {

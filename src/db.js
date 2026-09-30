@@ -1,11 +1,21 @@
-import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
-
 // All money is stored as integer paisa (1 PKR = 100 paisa) to avoid float rounding.
 // All rates are stored as basis points (17% = 1700).
-// Timestamps are local time 'YYYY-MM-DD HH:MM:SS' because the server runs at the counter.
-const SCHEMA = `
+// Timestamps are local time 'YYYY-MM-DD HH:MM:SS' (see configureClock).
+// This module has no Node-only imports so it also runs on Cloudflare Workers; see db-node.js.
+
+// SQLite modifier that turns UTC 'now' into pharmacy local time.
+const clock = { sqlModifier: 'localtime', offsetMinutes: null }
+
+// On servers whose clock is UTC (e.g. Cloudflare), pin the pharmacy's UTC offset explicitly.
+// Pakistan is UTC+5 with no daylight saving, so a fixed offset is exact.
+export function configureClock(utcOffsetMinutes) {
+  const m = Number(utcOffsetMinutes)
+  if (!Number.isFinite(m)) return
+  clock.offsetMinutes = m
+  clock.sqlModifier = `${m >= 0 ? '+' : '-'}${Math.abs(m)} minutes`
+}
+
+const schema = () => `
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -18,7 +28,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL CHECK (role IN ('admin', 'pharmacist', 'cashier')),
   active        INTEGER NOT NULL DEFAULT 1,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at    TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -36,7 +46,7 @@ CREATE TABLE IF NOT EXISTS products (
   reorder_level INTEGER NOT NULL DEFAULT 0,
   sale_price    INTEGER NOT NULL DEFAULT 0,  -- default retail price per unit, tax inclusive
   active        INTEGER NOT NULL DEFAULT 1,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at    TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 CREATE INDEX IF NOT EXISTS idx_products_name ON products(name);
 CREATE INDEX IF NOT EXISTS idx_products_generic ON products(generic_name);
@@ -48,7 +58,7 @@ CREATE TABLE IF NOT EXISTS suppliers (
   address    TEXT,
   ntn        TEXT,
   drug_license_no TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 
 CREATE TABLE IF NOT EXISTS purchases (
@@ -59,7 +69,7 @@ CREATE TABLE IF NOT EXISTS purchases (
   total        INTEGER NOT NULL DEFAULT 0,
   notes        TEXT,
   user_id      INTEGER NOT NULL REFERENCES users(id),
-  created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at   TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -70,7 +80,7 @@ CREATE TABLE IF NOT EXISTS batches (
   cost_price   INTEGER NOT NULL DEFAULT 0,  -- per unit
   sale_price   INTEGER NOT NULL,            -- per unit, tax inclusive (MRP)
   qty_on_hand  INTEGER NOT NULL DEFAULT 0 CHECK (qty_on_hand >= 0),
-  created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  created_at   TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}')),
   UNIQUE (product_id, batch_no)
 );
 CREATE INDEX IF NOT EXISTS idx_batches_fefo ON batches(product_id, expiry_date);
@@ -93,7 +103,7 @@ CREATE TABLE IF NOT EXISTS prescriptions (
   prescriber_reg_no TEXT,              -- PMDC registration number
   rx_date           TEXT,
   notes             TEXT,
-  created_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at        TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 
 CREATE TABLE IF NOT EXISTS sales (
@@ -111,7 +121,7 @@ CREATE TABLE IF NOT EXISTS sales (
   payment_method  TEXT NOT NULL CHECK (payment_method IN ('cash', 'card', 'wallet')),
   amount_paid     INTEGER NOT NULL,
   change_due      INTEGER NOT NULL DEFAULT 0,
-  created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at      TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
 
@@ -138,7 +148,7 @@ CREATE TABLE IF NOT EXISTS returns (
   user_id      INTEGER NOT NULL REFERENCES users(id),
   reason       TEXT,
   refund_total INTEGER NOT NULL,
-  created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at   TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 
 CREATE TABLE IF NOT EXISTS return_items (
@@ -162,7 +172,7 @@ CREATE TABLE IF NOT EXISTS stock_movements (
   ref_id     INTEGER,                 -- purchase / sale / return id
   user_id    INTEGER NOT NULL REFERENCES users(id),
   note       TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
 );
 CREATE INDEX IF NOT EXISTS idx_movements_product ON stock_movements(product_id, created_at);
 `
@@ -180,12 +190,9 @@ const DEFAULT_SETTINGS = {
   receipt_footer: 'Medicines once sold can be returned within 7 days with receipt, if unopened and stored properly.',
 }
 
-export function openDb(path = process.env.DB_PATH || 'data/pharmacy.db') {
-  if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-  const db = new DatabaseSync(path)
-  db.exec('PRAGMA foreign_keys = ON')
-  if (path !== ':memory:') db.exec('PRAGMA journal_mode = WAL')
-  db.exec(SCHEMA)
+// Creates tables and default settings if they don't exist. Safe to run on every start.
+export function initDb(db) {
+  db.exec(schema())
   const insert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
   for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) insert.run(k, v)
   return db
@@ -193,6 +200,8 @@ export function openDb(path = process.env.DB_PATH || 'data/pharmacy.db') {
 
 // Runs fn inside a write transaction; rolls back if it throws.
 export function transaction(db, fn) {
+  // Cloudflare Durable Object storage has its own transaction API and rejects BEGIN.
+  if (db.transactionSync) return db.transactionSync(fn)
   db.exec('BEGIN IMMEDIATE')
   try {
     const result = fn()
@@ -210,6 +219,9 @@ export function getSettings(db) {
 }
 
 export function today() {
+  if (clock.offsetMinutes !== null) {
+    return new Date(Date.now() + clock.offsetMinutes * 60000).toISOString().slice(0, 10)
+  }
   const d = new Date()
   const pad = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`

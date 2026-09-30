@@ -78,7 +78,19 @@ sqlite3 data/pharmacy.db ".backup 'backup-$(date +%F).db'"
 The app needs one always-on server with a persistent disk, because the database is a file. Serverless
 hosts (Netlify Functions, Vercel, Cloudflare Workers) can't keep it. Run exactly **one** instance.
 
-### Option A: Render (click-through)
+### Option A: Cloudflare Workers (how pharmacy.z88.tech runs)
+
+`worker/index.js` runs the same Express app inside a single Durable Object, whose built-in SQLite
+storage is the database (`worker/sql-storage-db.js` adapts it to the `node:sqlite` interface the app uses).
+Cloudflare Workers Builds deploys every push to `main` with `npx wrangler deploy`, using `wrangler.jsonc`.
+
+- `SETUP_TOKEN` is a Worker secret: `npx wrangler secret put SETUP_TOKEN`
+- `UTC_OFFSET_MINUTES` (default 300 = Pakistan) sets the pharmacy's local time, since Workers run on UTC
+- Local run in the Workers runtime: `npx wrangler dev`, then `TEST_BASE_URL=http://localhost:8787 npm test`
+  runs the API tests against it (on an empty database)
+- Durable Object storage keeps 30 days of point-in-time recovery; still export data regularly
+
+### Option B: Render (click-through)
 
 1. In Render: **New → Blueprint**, pick this repository. `render.yaml` creates a Docker web service with
    a 1 GB disk at `/data`, a health check, a random `SETUP_TOKEN`, and the custom domain `pharmacy.z88.tech`.
@@ -88,7 +100,7 @@ hosts (Netlify Functions, Vercel, Cloudflare Workers) can't keep it. Run exactly
 3. When Render shows the domain as verified, open https://pharmacy.z88.tech, paste the `SETUP_TOKEN`
    value from the service's Environment tab, and create the owner account.
 
-### Option B: any VPS with Docker
+### Option C: any VPS with Docker
 
 ```bash
 docker build -t pharmacy-pos .

@@ -1,7 +1,7 @@
 import express from 'express'
+import { fileURLToPath } from 'node:url'
 import helmet from 'helmet'
 import cookieParser from 'cookie-parser'
-import { fileURLToPath } from 'node:url'
 import { authenticate } from './auth.js'
 import authRoutes from './routes/auth.routes.js'
 import userRoutes from './routes/users.routes.js'
@@ -13,9 +13,10 @@ import inventoryRoutes from './routes/inventory.routes.js'
 import saleRoutes from './routes/sales.routes.js'
 import reportRoutes from './routes/reports.routes.js'
 
-const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
-
-export function createApp(db) {
+// publicDir: folder with the browser app on disk (Node).
+// staticFiles: { '/path': { type, body } } used instead when there is no file system (Cloudflare).
+export function createApp(db, { publicDir, staticFiles } = {}) {
+  if (publicDir === undefined && !staticFiles) publicDir = fileURLToPath(new URL('../public', import.meta.url))
   const app = express()
   app.disable('x-powered-by')
   // Behind a reverse proxy / load balancer, set TRUST_PROXY to the number of proxy hops
@@ -58,7 +59,14 @@ export function createApp(db) {
   api.use((req, res) => res.status(404).json({ message: 'Not found' }))
   app.use('/api', api)
 
-  app.use(express.static(PUBLIC_DIR))
+  if (publicDir) app.use(express.static(publicDir))
+  if (staticFiles) {
+    app.get('*', (req, res, next) => {
+      const file = staticFiles[req.path === '/' ? '/index.html' : req.path]
+      if (!file) return next()
+      res.type(file.type).set('cache-control', 'no-cache').send(file.body)
+    })
+  }
 
   app.use((err, req, res, next) => {
     if (err.type === 'entity.parse.failed') return res.status(400).json({ message: 'Invalid JSON' })

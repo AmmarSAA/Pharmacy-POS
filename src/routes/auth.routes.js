@@ -5,17 +5,26 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import { authenticate, signToken, COOKIE } from '../auth.js'
 import { HttpError, reqString } from '../lib/http.js'
 
-const cookieOpts = { httpOnly: true, sameSite: 'strict', secure: process.env.COOKIE_SECURE === '1', maxAge: 12 * 3600 * 1000 }
+const cookieOptions = () => ({
+  httpOnly: true,
+  sameSite: 'strict',
+  secure: process.env.COOKIE_SECURE === '1',
+  maxAge: 12 * 3600 * 1000,
+})
 
 // Slows password guessing: failed attempts per IP in a 15 minute window.
-const credentialLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  skipSuccessfulRequests: true,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { message: 'Too many attempts. Try again in 15 minutes.' },
-})
+const makeCredentialLimiter = () =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    skipSuccessfulRequests: true,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    // On Cloudflare the Worker passes the visitor's IP in a header it controls (CLIENT_IP_HEADER).
+    keyGenerator: (req) => (process.env.CLIENT_IP_HEADER && req.get(process.env.CLIENT_IP_HEADER)) || req.ip || 'unknown',
+    validate: { ip: false },
+    message: { message: 'Too many attempts. Try again in 15 minutes.' },
+  })
 
 const digest = (v) => createHash('sha256').update(String(v)).digest()
 
@@ -31,6 +40,8 @@ function checkSetupToken(given) {
 
 export default function authRoutes(db) {
   const r = Router()
+  // Created per app (not at import time): its store starts a timer, which Cloudflare forbids at startup.
+  const credentialLimiter = makeCredentialLimiter()
   const userCount = () => db.prepare('SELECT COUNT(*) AS n FROM users').get().n
 
   r.get('/status', (req, res) => {
@@ -51,7 +62,7 @@ export default function authRoutes(db) {
       .prepare("INSERT INTO users (username, full_name, password_hash, role) VALUES (?, ?, ?, 'admin')")
       .run(username, fullName, bcrypt.hashSync(password, 10))
     const user = { id: Number(lastInsertRowid), username, full_name: fullName, role: 'admin' }
-    res.cookie(COOKIE, signToken(db, user), cookieOpts).status(201).json({ user })
+    res.cookie(COOKIE, signToken(db, user), cookieOptions()).status(201).json({ user })
   })
 
   r.post('/login', credentialLimiter, (req, res) => {
@@ -62,11 +73,11 @@ export default function authRoutes(db) {
       throw new HttpError(401, 'Incorrect username or password')
     }
     const { password_hash, ...safe } = user
-    res.cookie(COOKIE, signToken(db, user), cookieOpts).json({ user: safe, token: signToken(db, user) })
+    res.cookie(COOKIE, signToken(db, user), cookieOptions()).json({ user: safe, token: signToken(db, user) })
   })
 
   r.post('/logout', (req, res) => {
-    res.clearCookie(COOKIE, { ...cookieOpts, maxAge: undefined }).json({ ok: true })
+    res.clearCookie(COOKIE, { ...cookieOptions(), maxAge: undefined }).json({ ok: true })
   })
 
   r.get('/me', authenticate(db), (req, res) => res.json({ user: req.user }))
