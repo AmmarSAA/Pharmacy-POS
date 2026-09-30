@@ -50,3 +50,52 @@ List/get also return `current_pack_price` (pack price of the batch that sells ne
   Cash purchase records a supplier payment for the total (method from `payment_method`, default cash;
   `till` also takes it from the open till).
 - `GET /purchases/:id` items include `packs`, `loose_qty`, `bonus_qty`, `pack_cost`, `discount_bps`, `pack_price`, `pack_size`.
+
+---
+
+# Round 2: owner controls, policies, department issues
+
+Schema is already in `src/db.js`: `users.is_owner`, `returns.refund_method`, `audit_log`, `departments`,
+`issue_requests`, `issue_request_items`, `issues`, `issue_items`, `issue_returns`, `issue_return_items`;
+stock movement reasons now include `issue` and `issue_return`. `PROTECTED_SETTINGS` is exported from db.js.
+
+## Owner and policies (coordinator)
+- `GET /auth/me` user includes `is_owner` (0/1). Exactly one owner: the account created at setup
+  (existing databases: the first admin).
+- `GET /settings` includes the protected keys (readable by everyone signed in):
+  `require_open_till` ('0'|'1'), `refund_card_sales` ('drawer'|'original'), `opening_balance_due`
+  ('terms'|'immediate'), `max_discount_cashier_bps`, `max_discount_pharmacist_bps`, `max_discount_admin_bps`.
+- `PUT /settings` rejects protected keys with 403. Owner changes them with
+  `PUT /owner/settings { current_password, ...keys }` (owner only; wrong password 403) -> settings.
+- `GET /owner/audit?limit=` (owner) -> `[{ id, created_at, user_name, action, detail }]` (detail parsed).
+- `POST /owner/transfer { user_id, current_password }` (owner) -> target must be an active admin; they
+  become owner, caller stops being owner.
+- Users: only the owner may create an admin, edit an admin, or change a role to/from admin. Nobody
+  can deactivate or demote the owner. User list rows include `is_owner`.
+- Discount caps come from the `max_discount_<role>_bps` settings (POS UI should read them too).
+- Returns: with `refund_card_sales = 'original'`, returns of card/wallet sales are refunded to that
+  method (`refund_method` = 'card'|'wallet', no till needed, not counted in till cash); otherwise
+  `refund_method = 'cash'` from the drawer. Sale detail `returns[]` include `refund_method`.
+  Till totals count only cash refunds.
+- Supplier dues: `opening_balance_due = 'terms'` makes the opening balance due opening_date + due_days.
+
+## Department issues (Agent D)
+- `GET /departments?all=1` (any signed-in), `POST /departments { name, incharge?, active? }`,
+  `PUT /departments/:id` (admin/pharmacist).
+- `GET /issue-requests?status=&department_id=`, `GET /issue-requests/:id` (items with product name,
+  pack_size, qty_requested, qty_issued, stock), `POST /issue-requests { department_id, requested_by?,
+  ref_no?, note?, items: [{ product_id, qty? | packs?, loose? }] }`, `POST /issue-requests/:id/cancel`.
+- `POST /issues { department_id, request_id?, received_by?, patient_name?, note?, items: [{ product_id,
+  qty? | packs?, loose?, request_item_id? }] }` -> FEFO from unexpired stock, 409 if short; each slice
+  an `issue_items` row valued at the batch `cost_price`; stock movement reason `issue` (ref_id = issue id,
+  note = department name); `issue_no` = `ISS-000001`; updates request `qty_issued` and status
+  (`partial`/`closed`). Controlled drugs need `received_by`.
+- `GET /issues?from=&to=&department_id=` (rows with department_name, item_count, total_cost, returned_cost),
+  `GET /issues/:id` (items with product/batch/expiry, returns).
+- `POST /issues/:id/returns { items: [{ issue_item_id, qty, restock? }], reason }` -> restocks unexpired
+  batches (movement `issue_return`), expired ones not restocked.
+- `GET /reports/department-usage?from=&to=&department_id=` -> without department: per department
+  `{ department_id, name, issues, issued_cost, returned_cost, net_cost }`; with: per product
+  `{ product_id, name, qty_issued, qty_returned, net_cost }`.
+- Controlled-drug register includes `issue`/`issue_return` movements with `department_name`.
+- Roles: all issue/request/department-write routes admin + pharmacist.

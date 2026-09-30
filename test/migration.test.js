@@ -17,6 +17,12 @@ CREATE TABLE suppliers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT, 
 CREATE TABLE batches (id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, batch_no TEXT NOT NULL,
   expiry_date TEXT NOT NULL, cost_price INTEGER NOT NULL DEFAULT 0, sale_price INTEGER NOT NULL,
   qty_on_hand INTEGER NOT NULL DEFAULT 0, created_at TEXT, UNIQUE (product_id, batch_no));
+CREATE TABLE stock_movements (id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+  change INTEGER NOT NULL, balance INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('purchase', 'sale', 'return', 'adjustment', 'expired', 'damaged')),
+  ref_id INTEGER, user_id INTEGER NOT NULL, note TEXT, created_at TEXT);
+INSERT INTO users (id, username, full_name, password_hash, role) VALUES (1, 'owner', 'Owner', 'x', 'admin'), (2, 'b', 'B', 'x', 'admin');
+INSERT INTO stock_movements (batch_id, product_id, change, balance, reason, user_id) VALUES (1, 1, 40, 40, 'purchase', 1);
 INSERT INTO products (id, name, pack_size, sale_price) VALUES (1, 'Panadol', 10, 250);
 INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price, qty_on_hand) VALUES (1, 'A1', '2030-01-01', 190, 250, 40);
 INSERT INTO suppliers (name) VALUES ('City Pharma');
@@ -40,4 +46,10 @@ test('a first-release database upgrades in place and keeps its data', () => {
   assert.deepEqual([b.pack_size, b.pack_price, b.qty_on_hand], [10, 2500, 40])
   assert.equal(db.prepare('SELECT due_days FROM suppliers').get().due_days, 0)
   assert.equal(db.prepare("SELECT value FROM settings WHERE key = 'default_margin_bps'").get().value, '1500')
+
+  // Stock movements rebuilt with the wider reason list, rows kept.
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM stock_movements').get().n, 1)
+  db.prepare("INSERT INTO stock_movements (batch_id, product_id, change, balance, reason, user_id) VALUES (1, 1, -2, 38, 'issue', 1)").run()
+  // The first admin became the owner.
+  assert.deepEqual(db.prepare('SELECT id FROM users WHERE is_owner = 1').all().map((r) => r.id), [1])
 })
