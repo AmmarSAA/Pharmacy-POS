@@ -114,3 +114,31 @@ test('till closes with the expected cash, then the day closes', async () => {
   assert.ok(day.summary)
   await expectStatus(409, 'POST', '/tills/day-close', {})
 })
+
+test('a ward requests stock, the pharmacy issues it at cost, the ward returns some', async () => {
+  const ward = (await call('POST', '/departments', { name: 'Emergency', incharge: 'Dr. Ali' })).body
+  const req = (await call('POST', '/issue-requests', {
+    department_id: ward.id, requested_by: 'Nurse Sara', items: [{ product_id: ids.itp, packs: 2 }],
+  })).body
+  const issue = (await call('POST', '/issues', {
+    department_id: ward.id, request_id: req.id, received_by: 'Nurse Sara', items: [{ product_id: ids.itp, packs: 2 }],
+  })).body
+  assert.match(issue.issue_no, /^ISS-\d{6}$/)
+  assert.equal(issue.total_cost, 20 * 1913) // cost per tablet: 191.25 / 10, rounded
+  assert.equal((await call('GET', `/issue-requests/${req.id}`)).body.status, 'closed')
+  const back = (await call('POST', `/issues/${issue.id}/returns`, {
+    items: [{ issue_item_id: issue.items[0].id, qty: 5 }], reason: 'not used',
+  })).body
+  assert.equal(back.items[0].returned_qty, 5)
+  const usage = (await call('GET', '/reports/department-usage')).body.find((d) => d.department_id === ward.id)
+  assert.equal(usage.net_cost, 15 * 1913)
+})
+
+test('owner policies need the owner password', async () => {
+  await expectStatus(403, 'PUT', '/settings', { require_open_till: '0' })
+  await expectStatus(403, 'PUT', '/owner/settings', { require_open_till: '0', current_password: 'nope' })
+  const s = (await call('PUT', '/owner/settings', { require_open_till: '0', current_password: 'secret123' })).body
+  assert.equal(s.require_open_till, '0')
+  const log = (await call('GET', '/owner/audit')).body
+  assert.equal(log[0].action, 'settings.update')
+})
