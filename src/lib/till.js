@@ -27,11 +27,11 @@ export function tillTotals(db, sessionId) {
     card_sales: byMethod('card'),
     wallet_sales: byMethod('wallet'),
     invoices: one('SELECT COUNT(*) AS v FROM sales WHERE till_session_id = ?'),
-    refunds: one('SELECT COALESCE(SUM(refund_total), 0) AS v FROM returns WHERE till_session_id = ?'),
+    // Only cash refunds leave the drawer; card/wallet refunds go back to the card/wallet.
+    refunds: one("SELECT COALESCE(SUM(refund_total), 0) AS v FROM returns WHERE till_session_id = ? AND refund_method = 'cash'"),
     cash_in: one("SELECT COALESCE(SUM(amount), 0) AS v FROM cash_movements WHERE till_session_id = ? AND direction = 'in'"),
     cash_out: one("SELECT COALESCE(SUM(amount), 0) AS v FROM cash_movements WHERE till_session_id = ? AND direction = 'out'"),
   }
-  // Refunds are paid in cash from the drawer.
   totals.expected_cash = totals.opening_cash + totals.cash_sales - totals.refunds + totals.cash_in - totals.cash_out
   return totals
 }

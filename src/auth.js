@@ -32,7 +32,7 @@ export function authenticate(db) {
     }
     // Re-read the user so deactivation and role changes take effect immediately.
     const user = db
-      .prepare('SELECT id, username, full_name, role, active FROM users WHERE id = ?')
+      .prepare('SELECT id, username, full_name, role, active, is_owner FROM users WHERE id = ?')
       .get(payload.sub)
     if (!user || !user.active) return next(new HttpError(401, 'Account is disabled'))
     req.user = user

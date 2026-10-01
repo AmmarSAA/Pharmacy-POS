@@ -16,7 +16,8 @@ export function daysBetween(from, to) {
   return Math.round((toUtc(to) - toUtc(from)) / 864e5)
 }
 
-// Opening balance counts as a bill dated opening_date (or the supplier's created date), due at once.
+// Opening balance counts as a bill dated opening_date (or the supplier's created date). It falls due
+// after the supplier's credit days, or at once when the owner sets opening_balance_due = 'immediate'.
 const openingDate = (s) => s.opening_date || String(s.created_at).slice(0, 10)
 
 function loadRows(db, supplierId) {
@@ -46,11 +47,12 @@ function group(rows) {
 
 // Settles one supplier's bills: payments tied to a purchase go to that purchase first,
 // everything else settles the oldest bills first. Returns ageing as of `asOf`.
-function dues(supplier, purchases, payments, asOf) {
+function dues(supplier, purchases, payments, asOf, openingDue = 'terms') {
   const bills = []
   if (supplier.opening_balance > 0) {
     const d = openingDate(supplier)
-    bills.push({ key: 'opening', date: d, due_date: d, amount: supplier.opening_balance, left: supplier.opening_balance })
+    const due = openingDue === 'immediate' ? d : addDays(d, supplier.due_days || 0)
+    bills.push({ key: 'opening', date: d, due_date: due, amount: supplier.opening_balance, left: supplier.opening_balance })
   }
   for (const p of purchases) {
     if (p.total > 0) bills.push({ key: p.id, date: p.date, due_date: p.due_date, amount: p.total, left: p.total })
@@ -106,7 +108,8 @@ export function supplierDues(db, { supplierId = null, asOf = today() } = {}) {
   const byP = group(purchases)
   const byPay = group(payments)
   const result = new Map()
-  for (const s of suppliers) result.set(s.id, dues(s, byP.get(s.id) || [], byPay.get(s.id) || [], asOf))
+  const openingDue = getSettings(db).opening_balance_due
+  for (const s of suppliers) result.set(s.id, dues(s, byP.get(s.id) || [], byPay.get(s.id) || [], asOf, openingDue))
   return result
 }
 

@@ -59,9 +59,9 @@ export default function authRoutes(db) {
     const pharmacyName = req.body.pharmacy_name?.trim()
     if (pharmacyName) db.prepare("UPDATE settings SET value = ? WHERE key = 'pharmacy_name'").run(pharmacyName)
     const { lastInsertRowid } = db
-      .prepare("INSERT INTO users (username, full_name, password_hash, role) VALUES (?, ?, ?, 'admin')")
+      .prepare("INSERT INTO users (username, full_name, password_hash, role, is_owner) VALUES (?, ?, ?, 'admin', 1)")
       .run(username, fullName, bcrypt.hashSync(password, 10))
-    const user = { id: Number(lastInsertRowid), username, full_name: fullName, role: 'admin' }
+    const user = { id: Number(lastInsertRowid), username, full_name: fullName, role: 'admin', is_owner: 1 }
     res.cookie(COOKIE, signToken(db, user), cookieOptions()).status(201).json({ user })
   })
 

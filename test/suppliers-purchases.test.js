@@ -38,7 +38,7 @@ test('setup users, products and suppliers', async () => {
   tokens.admin = (await call('POST', '/auth/login', { username: 'owner', password: 'secret123' })).body.token
   assert.equal((await call('POST', '/users', { username: 'cash1', full_name: 'Cash One', role: 'cashier', password: 'password1' })).status, 201)
   tokens.cashier = (await call('POST', '/auth/login', { username: 'cash1', password: 'password1' })).body.token
-  assert.equal((await call('PUT', '/settings', { require_open_till: '0' })).status, 200)
+  assert.equal((await call('PUT', '/owner/settings', { require_open_till: '0', current_password: 'secret123' })).status, 200)
 
   ids.priced = (await call('POST', '/products', { name: 'Brufen 400', pack_size: 10, pack_price: 1200 })).body.id
   ids.unpriced = (await call('POST', '/products', { name: 'Flagyl 400', pack_size: 10, sale_price: 0 })).body.id
@@ -260,13 +260,19 @@ test('ledger runs the balance from the opening balance', async () => {
 })
 
 test('dues report ages unpaid bills, oldest settled first', async () => {
-  // Bills: opening 50000 (due d-100), MD-1 2250 (due d-40), MD-2 5000 (due d+20). Paid 32000 -> opening left 18000.
+  // Bills: opening 50000 (dated d-100, due d-70 on 30-day terms), MD-1 2250 (due d-40), MD-2 5000 (due d+20).
+  // Paid 32000 -> opening left 18000.
   const rows = (await call('GET', '/reports/supplier-dues')).body
   const s1 = rows.find((r) => r.supplier_id === ids.s1)
   assert.deepEqual(s1, {
     supplier_id: ids.s1, name: 'Muller Distributors', due_days: 30, balance: 25250,
-    not_due: 5000, d1_30: 0, d31_60: 2250, d61_90: 0, d90_plus: 18000, overdue: 20250, oldest_unpaid_date: d(-100),
+    not_due: 5000, d1_30: 0, d31_60: 2250, d61_90: 18000, d90_plus: 0, overdue: 20250, oldest_unpaid_date: d(-100),
   })
+  // Owner policy "opening balance due immediately": due on its own date, 100 days ago.
+  db.prepare("UPDATE settings SET value = 'immediate' WHERE key = 'opening_balance_due'").run()
+  const immediate = (await call('GET', '/reports/supplier-dues')).body.find((r) => r.supplier_id === ids.s1)
+  assert.deepEqual([immediate.d61_90, immediate.d90_plus], [0, 18000])
+  db.prepare("UPDATE settings SET value = 'terms' WHERE key = 'opening_balance_due'").run()
   const s2 = rows.find((r) => r.supplier_id === ids.s2)
   assert.equal(s2.balance, 0)
   assert.equal(s2.overdue, 0)

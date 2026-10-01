@@ -123,17 +123,62 @@ export default function reportRoutes(db) {
         `SELECT m.id, m.created_at, m.reason, m.change, m.balance, m.note, p.name AS product_name, p.strength,
            b.batch_no, b.expiry_date, u.full_name AS user_name,
            s.invoice_no, rx.patient_name, rx.patient_cnic, rx.prescriber_name, rx.prescriber_reg_no,
-           su.name AS supplier_name, pu.invoice_no AS supplier_invoice
+           su.name AS supplier_name, pu.invoice_no AS supplier_invoice,
+           CASE WHEN m.reason = 'issue' THEN di.name WHEN m.reason = 'issue_return' THEN dr.name END AS department_name
          FROM stock_movements m
          JOIN products p ON p.id = m.product_id JOIN batches b ON b.id = m.batch_id JOIN users u ON u.id = m.user_id
          LEFT JOIN sales s ON m.reason = 'sale' AND s.id = m.ref_id
          LEFT JOIN prescriptions rx ON rx.id = s.prescription_id
          LEFT JOIN purchases pu ON m.reason = 'purchase' AND pu.id = m.ref_id
          LEFT JOIN suppliers su ON su.id = pu.supplier_id
+         LEFT JOIN issues iss ON m.reason = 'issue' AND iss.id = m.ref_id
+         LEFT JOIN departments di ON di.id = iss.department_id
+         LEFT JOIN issue_returns irt ON m.reason = 'issue_return' AND irt.id = m.ref_id
+         LEFT JOIN issues iss2 ON iss2.id = irt.issue_id
+         LEFT JOIN departments dr ON dr.id = iss2.department_id
          WHERE p.schedule = 'controlled' AND date(m.created_at) BETWEEN :from AND :to ${extra}
          ORDER BY m.id`,
       ).all(params),
     )
+  })
+
+  // Stock issued to departments, valued at cost. Without department_id: one row per department;
+  // with it: one row per product.
+  r.get('/department-usage', (req, res) => {
+    const { from, to } = range(req)
+    const params = { from, to }
+    if (req.query.department_id) {
+      params.dept = Number(req.query.department_id)
+      return res.json(
+        db.prepare(
+          `SELECT p.id AS product_id, p.name, SUM(ii.qty) AS qty_issued, SUM(ii.returned_qty) AS qty_returned,
+             SUM(ii.line_cost) - SUM(ii.unit_cost * ii.returned_qty) AS net_cost
+           FROM issue_items ii JOIN issues i ON i.id = ii.issue_id JOIN products p ON p.id = ii.product_id
+           WHERE i.department_id = :dept AND date(i.created_at) BETWEEN :from AND :to
+           GROUP BY p.id ORDER BY p.name`,
+        ).all(params),
+      )
+    }
+    const issued = db.prepare(
+      `SELECT d.id AS department_id, d.name, COUNT(i.id) AS issues, COALESCE(SUM(i.total_cost), 0) AS issued_cost
+       FROM departments d JOIN issues i ON i.department_id = d.id
+       WHERE date(i.created_at) BETWEEN :from AND :to GROUP BY d.id`,
+    ).all(params)
+    const returnedRows = db.prepare(
+      `SELECT d.id, d.name, COALESCE(SUM(r.total_cost), 0) AS cost
+       FROM issue_returns r JOIN issues i ON i.id = r.issue_id JOIN departments d ON d.id = i.department_id
+       WHERE date(r.created_at) BETWEEN :from AND :to GROUP BY d.id`,
+    ).all(params)
+    const returned = new Map(returnedRows.map((x) => [x.id, x.cost]))
+    // Departments with only returns in the range still show up.
+    for (const x of returnedRows) {
+      if (!issued.some((d) => d.department_id === x.id)) issued.push({ department_id: x.id, name: x.name, issues: 0, issued_cost: 0 })
+    }
+    const rows = issued.map((d) => {
+      const returned_cost = returned.get(d.department_id) || 0
+      return { ...d, returned_cost, net_cost: d.issued_cost - returned_cost }
+    })
+    res.json(rows.sort((a, b) => a.name.localeCompare(b.name)))
   })
 
   r.get('/expiry', (req, res) => {

@@ -7,7 +7,8 @@ import { percentOf, inclusiveTax, roundToRupee, packAmount } from '../lib/money.
 import { tillForCash } from '../lib/till.js'
 
 const PAYMENT_METHODS = ['cash', 'card', 'wallet']
-const MAX_DISCOUNT_BPS = { cashier: 1000, pharmacist: 2500, admin: 10000 }
+// Owner-set discount caps per role (settings max_discount_<role>_bps).
+const maxDiscountFor = (settings, role) => Number(settings[`max_discount_${role}_bps`] ?? 0)
 
 function readPrescription(body, needsControlled) {
   const rx = body.prescription
@@ -61,7 +62,7 @@ export default function saleRoutes(db) {
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('The cart is empty')
     const paymentMethod = oneOf(req.body.payment_method || 'cash', PAYMENT_METHODS, 'Payment method')
-    const maxDiscount = MAX_DISCOUNT_BPS[req.user.role]
+    const maxDiscount = maxDiscountFor(getSettings(db), req.user.role)
     const onDate = today()
 
     // Merge duplicate lines for the same product so FEFO allocation sees the full quantity.
@@ -225,7 +226,11 @@ export default function saleRoutes(db) {
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('Choose at least one item to return')
     const reason = reqString(req.body, 'reason', 'Reason')
-    const till = tillForCash(db, req.user.id, getSettings(db), 'refund')
+    // Card/wallet sales go back to the card/wallet when the owner allows it; everything else is cash.
+    const settings = getSettings(db)
+    const refundMethod =
+      settings.refund_card_sales === 'original' && sale.payment_method !== 'cash' ? sale.payment_method : 'cash'
+    const till = refundMethod === 'cash' ? tillForCash(db, req.user.id, settings, 'refund') : null
 
     transaction(db, () => {
       const lines = items.map((it, i) => {
@@ -241,8 +246,8 @@ export default function saleRoutes(db) {
       })
       const refundTotal = lines.reduce((s, l) => s + l.amount, 0)
       const returnId = Number(
-        db.prepare('INSERT INTO returns (sale_id, user_id, reason, refund_total, till_session_id) VALUES (?, ?, ?, ?, ?)')
-          .run(saleId, req.user.id, reason, refundTotal, till?.id ?? null).lastInsertRowid,
+        db.prepare('INSERT INTO returns (sale_id, user_id, reason, refund_total, till_session_id, refund_method) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(saleId, req.user.id, reason, refundTotal, till?.id ?? null, refundMethod).lastInsertRowid,
       )
       for (const l of lines) {
         db.prepare('INSERT INTO return_items (return_id, sale_item_id, qty, amount, tax, restocked) VALUES (?, ?, ?, ?, ?, ?)')

@@ -2,8 +2,14 @@ import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import { requireRole, ROLES } from '../auth.js'
 import { HttpError, notFound, reqString, oneOf } from '../lib/http.js'
+import { audit } from '../lib/audit.js'
 
-const COLS = 'id, username, full_name, role, active, created_at'
+const COLS = 'id, username, full_name, role, active, is_owner, created_at'
+
+// Admins can run the pharmacy; only the owner can make, change or remove admins.
+const ownerOnly = (req, what) => {
+  if (!req.user.is_owner) throw new HttpError(403, `Only the owner can ${what}`)
+}
 
 export default function userRoutes(db) {
   const r = Router()
@@ -22,9 +28,11 @@ export default function userRoutes(db) {
     if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
       throw new HttpError(409, 'That username is taken')
     }
+    if (role === 'admin') ownerOnly(req, 'add an admin')
     const { lastInsertRowid } = db
       .prepare('INSERT INTO users (username, full_name, password_hash, role) VALUES (?, ?, ?, ?)')
       .run(username, fullName, bcrypt.hashSync(password, 10), role)
+    audit(db, req.user.id, 'user.create', { username, role })
     res.status(201).json(db.prepare(`SELECT ${COLS} FROM users WHERE id = ?`).get(lastInsertRowid))
   })
 
@@ -38,6 +46,10 @@ export default function userRoutes(db) {
     if (id === req.user.id && (role !== 'admin' || !active)) {
       throw new HttpError(400, 'You cannot remove your own admin access')
     }
+    if (user.is_owner && (role !== 'admin' || !active)) {
+      throw new HttpError(400, 'The owner stays an active admin; transfer ownership first')
+    }
+    if ((user.role === 'admin' || role === 'admin') && id !== req.user.id) ownerOnly(req, 'change an admin account')
     let hash = user.password_hash
     if (req.body.password) {
       if (String(req.body.password).length < 8) throw new HttpError(400, 'Password must be at least 8 characters')
@@ -45,6 +57,12 @@ export default function userRoutes(db) {
     }
     db.prepare('UPDATE users SET full_name = ?, role = ?, active = ?, password_hash = ? WHERE id = ?')
       .run(fullName, role, active, hash, id)
+    const changed = {}
+    if (fullName !== user.full_name) changed.full_name = fullName
+    if (role !== user.role) changed.role = { from: user.role, to: role }
+    if (active !== user.active) changed.active = active
+    if (hash !== user.password_hash) changed.password = 'reset'
+    if (Object.keys(changed).length) audit(db, req.user.id, 'user.update', { username: user.username, ...changed })
     res.json(db.prepare(`SELECT ${COLS} FROM users WHERE id = ?`).get(id))
   })
 
