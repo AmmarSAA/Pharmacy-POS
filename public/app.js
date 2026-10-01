@@ -282,10 +282,12 @@ const ROUTES = [
   { path: 'purchases', label: 'Purchases', view: purchasesView, roles: ['admin', 'pharmacist'] },
   { path: 'suppliers', label: 'Suppliers', view: suppliersView, roles: ['admin', 'pharmacist'] },
   { path: 'reports', label: 'Reports', view: reportsView, roles: ['admin', 'pharmacist'] },
+  { path: 'issues', label: 'Issues', view: issuesView, roles: ['admin', 'pharmacist'] },
   { path: 'users', label: 'Users', view: usersView, roles: ['admin'] },
+  { path: 'owner', label: 'Owner', view: ownerView, ownerOnly: true },
   { path: 'settings', label: 'Settings', view: settingsView },
 ]
-const allowed = () => ROUTES.filter((r) => !r.roles || can(...r.roles))
+const allowed = () => ROUTES.filter((r) => (!r.roles || can(...r.roles)) && (!r.ownerOnly || state.user?.is_owner))
 let teardown = null
 
 function renderShell() {
@@ -293,7 +295,7 @@ function renderShell() {
     <nav class="side">
       <div class="brand">${esc(state.settings.pharmacy_name)}</div>
       ${allowed().map((r) => `<a href="#/${r.path}" data-path="${r.path}">${r.label}</a>`).join('')}
-      <div class="who">${esc(state.user.full_name)}<br><span>${esc(state.user.role)}</span><br>
+      <div class="who">${esc(state.user.full_name)}<br><span>${esc(state.user.role)}${state.user.is_owner ? ' · owner' : ''}</span><br>
         <button class="link" id="logout">Sign out</button></div>
     </nav>
     <main id="view"></main>
@@ -372,6 +374,13 @@ function receiptHtml(sale) {
 
 // ---------- point of sale ----------
 
+const DEFAULT_DISCOUNT_BPS = { cashier: 1000, pharmacist: 2500, admin: 10000 }
+// Highest discount (in percent) a role may give, from the owner's policy settings.
+const discountCapPct = (role) => {
+  const bps = Number(state.settings[`max_discount_${role}_bps`] ?? DEFAULT_DISCOUNT_BPS[role] ?? 0)
+  return (Number.isFinite(bps) ? bps : 0) / 100
+}
+const REFUND_LABELS = { cash: 'Cash', card: 'Card', wallet: 'Wallet' }
 const canLoose = (p) => (p.pack_size || 1) > 1 && p.allow_loose !== 0
 const lineUnits = (l) => l.packs * (l.product.pack_size || 1) + l.loose
 const lineGross = (l) => packAmount(lineUnits(l), packPriceOf(l.product), l.product.pack_size)
@@ -389,7 +398,7 @@ const tillBlocks = (till) => state.settings.require_open_till === '1' && till &&
 function posView(view) {
   const rxDefaults = () => ({ patient_name: '', patient_phone: '', patient_cnic: '', prescriber_name: '', prescriber_reg_no: '', rx_date: today(), notes: '' })
   const pos = { cart: [], results: [], hl: 0, method: 'cash', paid: '', customer: '', phone: '', rx: rxDefaults(), busy: false, till: null }
-  const maxDiscount = { cashier: 10, pharmacist: 25, admin: 100 }[state.user.role]
+  const maxDiscount = discountCapPct(state.user.role)
 
   view.innerHTML = `<div class="pos">
     <div class="stack">
@@ -751,6 +760,7 @@ async function openSale(id, onChange) {
   const sale = await get(`/sales/${id}`)
   const canReturn = can('admin', 'pharmacist')
   const returnable = sale.items.filter((i) => i.qty > i.returned_qty)
+  const toOriginal = state.settings.refund_card_sales === 'original' && ['card', 'wallet'].includes(sale.payment_method)
   const m = modal(`
     <div class="row"><h2>${esc(sale.invoice_no)}</h2><div class="spacer"></div><button id="print">Print receipt</button></div>
     ${sale.prescription ? `<p class="muted">Rx: ${esc(sale.prescription.patient_name)}${sale.prescription.patient_cnic ? ` (${esc(sale.prescription.patient_cnic)})` : ''}
@@ -765,9 +775,10 @@ async function openSale(id, onChange) {
         ${canReturn ? `<td>${i.qty > i.returned_qty ? `<input type="number" min="0" max="${i.qty - i.returned_qty}" value="0" name="r${i.id}" aria-label="Return quantity (units)">` : ''}</td>` : ''}
       </tr>`).join('')}</tbody></table></div>
       <p class="num">Total ${rs(sale.total)} · ${esc(sale.payment_method)} · ${esc(sale.created_at)} · ${esc(sale.cashier_name)}</p>
-      ${sale.returns.length ? `<h3>Returns</h3><ul>${sale.returns.map((r) => `<li>${esc(r.created_at)} — ${rs(r.refund_total)} by ${esc(r.user_name)}: ${esc(r.reason)}</li>`).join('')}</ul>` : ''}
+      ${sale.returns.length ? `<h3>Returns</h3><ul>${sale.returns.map((r) => `<li>${esc(r.created_at)} — ${rs(r.refund_total)} (${esc(REFUND_LABELS[r.refund_method] || 'Cash')}) by ${esc(r.user_name)}: ${esc(r.reason)}</li>`).join('')}</ul>` : ''}
       ${canReturn && returnable.length ? `<div class="row"><label class="field" style="flex:1">Return reason<input name="reason" placeholder="e.g. wrong item, unopened"></label>
-        <label class="row" style="font-size:13px"><input type="checkbox" name="restock" checked> Put back in stock</label></div>` : ''}
+        <label class="row" style="font-size:13px"><input type="checkbox" name="restock" checked> Put back in stock</label></div>
+        <p class="muted" style="font-size:13px" id="refund-note">${toOriginal ? `Refund goes back to ${esc(sale.payment_method === 'wallet' ? 'the wallet' : 'the card')} (no till needed).` : 'Refund is paid in cash from your till drawer.'}</p>` : ''}
       <div class="actions"><button type="button" data-close>Close</button>${canReturn && returnable.length ? '<button class="primary">Process return</button>' : ''}</div>
     </form>`, { wide: true })
   $('#print', m.el).addEventListener('click', () => printHtml(receiptHtml(sale)))
@@ -1481,7 +1492,7 @@ async function reportsView(view) {
       <input type="date" id="from" value="${f.from}" aria-label="From"> – <input type="date" id="to" value="${f.to}" aria-label="To">
       <button id="print">Print</button></div>
     <div class="tabs" id="tabs">
-      ${[['summary', 'Sales summary'], ['top', 'Top products'], ['low', 'Low stock'], ['expiry', 'Expiry'], ['valuation', 'Stock value'], ['controlled', 'Controlled drug register'], ['dues', 'Supplier dues']]
+      ${[['summary', 'Sales summary'], ['top', 'Top products'], ['low', 'Low stock'], ['expiry', 'Expiry'], ['valuation', 'Stock value'], ['controlled', 'Controlled drug register'], ['dues', 'Supplier dues'], ['deptusage', 'Department usage']]
         .map(([k, l]) => `<button data-t="${k}" class="${k === f.tab ? 'sel' : ''}">${l}</button>`).join('')}
     </div>
     <div id="out"></div></div>`
@@ -1534,7 +1545,9 @@ async function reportsView(view) {
           <td class="num">${r.change > 0 ? r.change : ''}</td><td class="num">${r.change < 0 ? -r.change : ''}</td><td class="num">${r.balance}</td>
           <td>${esc(r.patient_name || '')}${r.patient_cnic ? `<br>${esc(r.patient_cnic)}` : ''}</td>
           <td>${esc(r.prescriber_name || '')}${r.prescriber_reg_no ? `<br>${esc(r.prescriber_reg_no)}` : ''}</td>
-          <td>${esc(r.supplier_name || r.invoice_no || r.note || '')}${r.supplier_invoice ? ` / ${esc(r.supplier_invoice)}` : ''}</td><td>${esc(r.user_name)}</td></tr>`))
+          <td>${r.department_name ? `Dept: ${esc(r.department_name)}` : esc(r.supplier_name || r.invoice_no || r.note || '')}${r.supplier_invoice ? ` / ${esc(r.supplier_invoice)}` : ''}</td><td>${esc(r.user_name)}</td></tr>`))
+    } else if (f.tab === 'deptusage') {
+      await deptUsageReport(out, f, (t) => { title = t })
     } else if (f.tab === 'dues') {
       const rows = await get('/reports/supplier-dues')
       title = `Supplier dues as of ${today()}`
@@ -1578,23 +1591,28 @@ async function usersView(view) {
   view.innerHTML = `<div class="stack">
     <div class="row"><h1>Users</h1><div class="spacer"></div><button class="primary" id="add">Add user</button></div>
     <div class="panel table-wrap" id="list"></div>
-    <p class="muted" style="font-size:13px">Cashiers: sell, discounts up to 10%, see only their own sales. Pharmacists: also controlled drugs, returns, stock, purchases and reports, discounts up to 25%. Admins: everything including users and settings.</p></div>`
+    <p class="muted" style="font-size:13px">Cashiers: sell, see only their own sales. Pharmacists: also controlled drugs, returns, stock, purchases, reports and department issues. Admins: everything including users and settings. Discount limits per role are set by the owner. Only the owner can add or change admins.</p></div>`
   let rows = []
+  const isOwner = !!state.user.is_owner
+  // Only the owner may touch admin accounts.
+  const editable = (u) => isOwner || u.role !== 'admin'
   const load = async () => {
     rows = await get('/users')
     $('#list', view).innerHTML = `<table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Created</th></tr></thead>
-      <tbody>${rows.map((u) => `<tr class="clickable" data-id="${u.id}"><td>${esc(u.full_name)}</td><td>${esc(u.username)}</td><td>${esc(u.role)}</td>
+      <tbody>${rows.map((u) => `<tr class="${editable(u) ? 'clickable' : ''}" data-id="${u.id}"><td>${esc(u.full_name)}</td><td>${esc(u.username)}</td>
+        <td>${esc(u.role)} ${u.is_owner ? '<span class="badge ok">Owner</span>' : ''}${editable(u) ? '' : ' <span class="muted" style="font-size:12px">read-only</span>'}</td>
         <td>${u.active ? 'Active' : '<span class="muted">Disabled</span>'}</td><td>${esc(u.created_at)}</td></tr>`).join('')}</tbody></table>`
   }
   const form = (u) => {
-    const roleSel = (r) => ['cashier', 'pharmacist', 'admin'].map((x) => `<option ${x === r ? 'selected' : ''}>${x}</option>`).join('')
+    const roleSel = (r) => (isOwner ? ['cashier', 'pharmacist', 'admin'] : ['cashier', 'pharmacist']).map((x) => `<option ${x === r ? 'selected' : ''}>${x}</option>`).join('')
     const m = modal(`<form id="uf"><h2>${u ? `Edit ${esc(u.username)}` : 'Add user'}</h2><div class="grid">
       ${u ? '' : '<label class="field">Username *<input name="username" required></label>'}
       <label class="field">Full name *<input name="full_name" value="${esc(u?.full_name)}" required></label>
-      <label class="field">Role<select name="role">${roleSel(u?.role || 'cashier')}</select></label>
+      ${u?.is_owner ? '<div class="field">Role<div><b>admin</b> <span class="badge ok">Owner</span></div></div>' : `<label class="field">Role<select name="role">${roleSel(u?.role || 'cashier')}</select></label>`}
       <label class="field">${u ? 'New password (leave blank to keep)' : 'Password *'}<input name="password" type="password" minlength="8" ${u ? '' : 'required'} autocomplete="new-password"></label>
       </div>
-      ${u ? `<label class="row" style="margin-top:10px"><input type="checkbox" name="active" ${u.active ? 'checked' : ''}> Active</label>` : ''}
+      ${u && !u.is_owner ? `<label class="row" style="margin-top:10px"><input type="checkbox" name="active" ${u.active ? 'checked' : ''}> Active</label>` : ''}
+      ${u?.is_owner ? '<p class="muted" style="font-size:13px">The owner cannot be deactivated or demoted. Transfer ownership from the Owner panel first.</p>' : ''}
       <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`)
     $('#uf', m.el).addEventListener('submit', guard(async (e) => {
       e.preventDefault()
@@ -1613,12 +1631,24 @@ async function usersView(view) {
   $('#add', view).addEventListener('click', () => form(null))
   $('#list', view).addEventListener('click', (e) => {
     const tr = e.target.closest('tr[data-id]')
-    if (tr) form(rows.find((u) => u.id === Number(tr.dataset.id)))
+    const u = tr && rows.find((x) => x.id === Number(tr.dataset.id))
+    if (u && editable(u)) form(u)
   })
   await load()
 }
 
 // ---------- settings ----------
+
+const POLICY_KEYS = ['require_open_till', 'refund_card_sales', 'opening_balance_due', 'max_discount_cashier_bps', 'max_discount_pharmacist_bps', 'max_discount_admin_bps']
+const policyLabels = (s) => [
+  ['Every sale needs an open till', s.require_open_till === '0' ? 'No' : 'Yes'],
+  ['Refunds of card/wallet sales', s.refund_card_sales === 'original' ? 'Back to card or wallet' : 'Cash from drawer'],
+  ['Supplier opening balance falls due', s.opening_balance_due === 'immediate' ? 'Immediately' : 'After credit days'],
+  ['Max discount: cashier', pct(s.max_discount_cashier_bps ?? DEFAULT_DISCOUNT_BPS.cashier)],
+  ['Max discount: pharmacist', pct(s.max_discount_pharmacist_bps ?? DEFAULT_DISCOUNT_BPS.pharmacist)],
+  ['Max discount: admin', pct(s.max_discount_admin_bps ?? DEFAULT_DISCOUNT_BPS.admin)],
+]
+const policyRowsHtml = (s) => policyLabels(s).map(([l, v]) => `<div class="field">${esc(l)}<div style="color:var(--text);font-size:15px"><b>${esc(v)}</b></div></div>`).join('')
 
 async function settingsView(view) {
   const s = state.settings
@@ -1645,10 +1675,11 @@ async function settingsView(view) {
       </div>
       <h2>Cash control</h2>
       <div class="grid">
-        <label class="field">Every sale needs an open till<select name="require_open_till" ${admin ? '' : 'disabled'}>
-          <option value="1" ${s.require_open_till === '0' ? '' : 'selected'}>Yes</option><option value="0" ${s.require_open_till === '0' ? 'selected' : ''}>No</option></select></label>
         ${field('cash_denominations', 'Cash denominations (Rs, comma separated)', 'pattern="\\s*\\d+(\\s*,\\s*\\d+)*\\s*" placeholder="5000,1000,500,100,50,20,10,5,2,1"')}
       </div>
+      <h2>Policies</h2>
+      <div class="grid" id="policies">${policyRowsHtml(s)}</div>
+      <p class="muted" style="font-size:13px">Changed by the owner in the Owner panel.</p>
       <label class="field">Receipt footer<textarea name="receipt_footer" rows="2" ${admin ? '' : 'disabled'}>${esc(s.receipt_footer)}</textarea></label>
       ${admin ? '<div><button class="primary">Save settings</button></div>' : '<p class="muted">Only an admin can change these.</p>'}
     </form>
@@ -1668,6 +1699,7 @@ async function settingsView(view) {
     d.cash_denominations = String(d.cash_denominations || '').replace(/\s+/g, '')
     delete d.gst
     delete d.margin
+    for (const k of POLICY_KEYS) delete d[k]
     state.settings = await put('/settings', d)
     toast('Settings saved')
     renderShell()
@@ -1891,6 +1923,626 @@ async function tillView(view) {
     await loadDay()
   }))
   await reloadAll()
+}
+
+// ---------- owner panel ----------
+
+const ownerSelect = (name, label, options, current) => `<label class="field">${label}<select name="${name}">
+  ${options.map(([v, l]) => `<option value="${v}" ${v === current ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`
+
+// Audit detail is JSON; show it as "key: value" pairs.
+function auditDetailText(detail) {
+  const d = parseJson(detail)
+  if (d === null || typeof d !== 'object') return String(detail ?? '')
+  return Object.entries(d)
+    .map(([k, v]) => {
+      const text = v !== null && typeof v === 'object'
+        ? ('from' in v && 'to' in v ? `${v.from} → ${v.to}` : JSON.stringify(v))
+        : v
+      return `${k.replace(/_/g, ' ')}: ${text}`
+    })
+    .join(' · ')
+}
+
+async function ownerView(view) {
+  const s = state.settings
+  view.innerHTML = `<div class="stack">
+    <h1>Owner</h1>
+    <form class="panel stack" id="policy">
+      <h2>Policy settings</h2>
+      <div class="grid">
+        ${ownerSelect('require_open_till', 'Every sale needs an open till', [['1', 'Yes'], ['0', 'No']], s.require_open_till === '0' ? '0' : '1')}
+        ${ownerSelect('refund_card_sales', 'Refunds of card/wallet sales', [['drawer', 'Cash from drawer'], ['original', 'Back to card or wallet']], s.refund_card_sales === 'original' ? 'original' : 'drawer')}
+        ${ownerSelect('opening_balance_due', 'Supplier opening balance falls due', [['terms', 'After credit days'], ['immediate', 'Immediately']], s.opening_balance_due === 'immediate' ? 'immediate' : 'terms')}
+      </div>
+      <h3>Maximum discount per role</h3>
+      <div class="grid">
+        ${['cashier', 'pharmacist', 'admin'].map((r) => `<label class="field">${r[0].toUpperCase() + r.slice(1)} (%)
+          <input name="max_discount_${r}_bps" type="number" min="0" max="100" step="0.01" inputmode="decimal" value="${Number(s[`max_discount_${r}_bps`] ?? DEFAULT_DISCOUNT_BPS[r]) / 100}"></label>`).join('')}
+      </div>
+      <div class="row">
+        <label class="field" style="flex:1;max-width:320px">Your password (to confirm)<input name="current_password" type="password" required autocomplete="current-password"></label>
+        <button class="primary" style="align-self:flex-end">Save policies</button>
+      </div>
+    </form>
+    <form class="panel stack" id="transfer">
+      <h2>Transfer ownership</h2>
+      <p class="muted" style="font-size:13px;margin:0">The new owner must be an active admin. You stay an admin but lose the owner controls.</p>
+      <div class="row">
+        <label class="field" style="flex:1;min-width:200px">New owner<select name="user_id" required id="newowner"><option value="">Loading…</option></select></label>
+        <label class="field" style="flex:1;min-width:200px">Your password<input name="current_password" type="password" required autocomplete="current-password"></label>
+        <button class="danger" style="align-self:flex-end">Transfer…</button>
+      </div>
+    </form>
+    <div class="panel">
+      <h2>Audit log</h2>
+      <div class="table-wrap" id="audit"><p class="muted">Loading…</p></div>
+    </div></div>`
+
+  $('#policy', view).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    const d = formData(e.target)
+    const body = { current_password: d.current_password }
+    for (const k of ['require_open_till', 'refund_card_sales', 'opening_balance_due']) body[k] = d[k]
+    for (const r of ['cashier', 'pharmacist', 'admin']) {
+      const n = Number(d[`max_discount_${r}_bps`])
+      if (!Number.isFinite(n) || n < 0 || n > 100) throw new Error(`Enter a ${r} discount between 0 and 100`)
+      body[`max_discount_${r}_bps`] = String(Math.round(n * 100))
+    }
+    await put('/owner/settings', body)
+    await loadSettings()
+    e.target.elements.current_password.value = ''
+    toast('Policies saved')
+    loadAudit().catch(() => {})
+  }))
+
+  const users = await get('/users').catch(() => [])
+  const admins = users.filter((u) => u.role === 'admin' && u.active && u.id !== state.user.id)
+  $('#newowner', view).innerHTML = admins.length
+    ? `<option value="">Choose an admin…</option>${admins.map((u) => `<option value="${u.id}">${esc(u.full_name)} (${esc(u.username)})</option>`).join('')}`
+    : '<option value="">No other active admin</option>'
+  $('#transfer', view).addEventListener('submit', (e) => {
+    e.preventDefault()
+    const d = formData(e.target)
+    const target = admins.find((u) => String(u.id) === d.user_id)
+    if (!target) return toast('Choose an admin to receive ownership', true)
+    const m = modal(`<h2>Transfer ownership?</h2>
+      <p><b>${esc(target.full_name)}</b> will become the owner. You will no longer be able to change policies, view the audit log or transfer ownership.</p>
+      <div class="actions"><button type="button" data-close>Cancel</button><button class="primary danger" id="confirm-transfer">Yes, transfer ownership</button></div>`)
+    $('#confirm-transfer', m.el).addEventListener('click', guard(async () => {
+      await post('/owner/transfer', { user_id: target.id, current_password: d.current_password })
+      m.close()
+      const { user } = await get('/auth/me')
+      state.user = user
+      await loadSettings()
+      toast(`${target.full_name} is now the owner`)
+      location.hash = '#/settings'
+      renderShell()
+    }))
+  })
+
+  async function loadAudit() {
+    const rows = await get('/owner/audit?limit=200')
+    $('#audit', view).innerHTML = rows.length === 0 ? '<p class="muted">Nothing recorded yet.</p>' : `<table>
+      <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Detail</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><td style="white-space:nowrap">${esc(r.created_at)}</td><td>${esc(r.user_name || '')}</td>
+        <td>${esc(String(r.action || '').replace(/[._]/g, ' '))}</td><td style="font-size:13px;word-break:break-word">${esc(auditDetailText(r.detail))}</td></tr>`).join('')}</tbody></table>`
+  }
+  await loadAudit()
+}
+
+// ---------- department issues ----------
+
+const isoDaysAgo = (n) => {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
+}
+const STATUS_BADGE = { open: 'near', partial: 'near', closed: 'ok', cancelled: 'expired' }
+const statusBadge = (st) => `<span class="badge ${STATUS_BADGE[st] || 'otc'}">${esc(st)}</span>`
+
+// Search box that adds products via onPick. Enter picks the highlighted match or an exact barcode.
+function itemPicker(box, onPick, placeholder = 'Scan barcode or search medicine / generic name') {
+  box.innerHTML = `<div class="search-box"><input placeholder="${esc(placeholder)}" autocomplete="off" aria-label="Search items">
+    <div class="results" hidden></div></div>`
+  const input = $('input', box)
+  const results = $('.results', box)
+  let list = []
+  let hl = 0
+  let seq = 0
+  let timer = null
+  const renderResults = () => {
+    results.hidden = list.length === 0 || !input.value.trim()
+    results.innerHTML = list.map((p, i) => `<button type="button" data-i="${i}" class="${i === hl ? 'hl' : ''}">
+      <div style="flex:1"><div class="name">${esc(productLabel(p))} ${schedBadge(p.schedule)}</div>
+        <div class="muted">${esc(p.generic_name || '')}${p.manufacturer ? ' · ' + esc(p.manufacturer) : ''}</div></div>
+      <div class="num muted">${p.stock > 0 ? `${esc(packsText(p.stock, p.pack_size))} in stock` : '<span class="badge expired">Out of stock</span>'}</div></button>`).join('')
+  }
+  const search = async (text) => {
+    const my = ++seq
+    const rows = text ? await get(`/products?q=${encodeURIComponent(text)}&limit=20`) : []
+    if (my !== seq) return null
+    list = rows
+    hl = 0
+    renderResults()
+    return rows
+  }
+  const pick = (p) => {
+    input.value = ''
+    list = []
+    renderResults()
+    onPick(p)
+    input.focus()
+  }
+  input.addEventListener('input', () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => search(input.value.trim()).catch((e) => toast(e.message, true)), 150)
+  })
+  input.addEventListener('keydown', guard(async (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (list.length) hl = (hl + (e.key === 'ArrowDown' ? 1 : list.length - 1)) % list.length
+      renderResults()
+    } else if (e.key === 'Escape') {
+      input.value = ''
+      list = []
+      renderResults()
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      const text = input.value.trim()
+      if (!text) return
+      clearTimeout(timer)
+      const rows = (await search(text)) || list
+      const found = rows.find((p) => p.barcode === text) || rows[hl] || (rows.length === 1 ? rows[0] : null)
+      if (found) pick(found)
+      else toast(`No product matches "${text}"`, true)
+    }
+  }))
+  results.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-i]')
+    if (b) pick(list[Number(b.dataset.i)])
+  })
+  return { focus: () => input.focus() }
+}
+
+// Packs/loose grid used by issues and requisitions. `lines` is mutated in place.
+// opts: checkStock (reject more than is in stock), extra(line) -> html under the item name, onChange().
+function qtyGrid(box, lines, opts = {}) {
+  const render = () => {
+    box.innerHTML = lines.length === 0
+      ? '<div class="cart-empty">No items yet. Scan a barcode or search to add medicines.</div>'
+      : `<div class="table-wrap"><table class="cart-table">
+          <thead><tr><th>Item</th><th class="num">Stock</th><th>Packs</th><th>Loose</th><th class="num">Units</th><th></th></tr></thead>
+          <tbody>${lines.map((l, i) => {
+            const p = l.product
+            const ps = p.pack_size || 1
+            const over = lineUnits(l) > p.stock
+            return `<tr><td>${esc(productLabel(p))} ${schedBadge(p.schedule)}
+                <div class="muted">${ps > 1 ? `${esc(p.packing || 'Pack')} of ${ps}` : 'Single unit'}${opts.extra ? ' ' + opts.extra(l) : ''}</div></td>
+              <td class="num" ${over && opts.checkStock ? 'style="color:var(--danger)"' : ''}>${esc(packsText(p.stock, ps))}</td>
+              <td><input type="number" min="0" value="${l.packs}" data-packs="${i}" aria-label="Packs" class="qty"></td>
+              <td>${canLoose(p) ? `<input type="number" min="0" max="${ps - 1}" value="${l.loose}" data-loose="${i}" aria-label="Loose units" class="qty">` : '<span class="muted">—</span>'}</td>
+              <td class="num">${lineUnits(l)}</td>
+              <td><button type="button" class="link danger" data-rm="${i}" aria-label="Remove ${esc(p.name)}">✕</button></td></tr>`
+          }).join('')}</tbody></table></div>`
+    opts.onChange?.()
+  }
+  const setQty = (line, packs, loose) => {
+    const ps = line.product.pack_size || 1
+    let p = Math.max(0, Math.floor(packs) || 0)
+    let lo = canLoose(line.product) ? Math.max(0, Math.floor(loose) || 0) : 0
+    if (ps > 1 && lo >= ps) { p += Math.floor(lo / ps); lo %= ps }
+    const units = p * ps + lo
+    if (units < 1) return toast('Quantity must be at least 1 — use ✕ to remove the line', true)
+    if (opts.checkStock && units > line.product.stock) return toast(`Only ${packsText(line.product.stock, ps)} of ${line.product.name} in stock`, true)
+    line.packs = p
+    line.loose = lo
+  }
+  box.addEventListener('change', (e) => {
+    const { packs, loose } = e.target.dataset
+    const idx = packs ?? loose
+    if (idx === undefined) return
+    const line = lines[idx]
+    if (packs !== undefined) setQty(line, Number(e.target.value), line.loose)
+    else setQty(line, line.packs, Number(e.target.value))
+    render()
+  })
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-rm]')
+    if (!b) return
+    lines.splice(Number(b.dataset.rm), 1)
+    render()
+  })
+  return {
+    render,
+    add(p) {
+      if (opts.checkStock && p.stock <= 0) return toast(`${p.name} is out of stock`, true)
+      const line = lines.find((l) => l.product.id === p.id && !l.request_item_id) || lines.find((l) => l.product.id === p.id)
+      if (line) {
+        setQty(line, line.packs + 1, line.loose)
+      } else {
+        if (opts.checkStock && (p.pack_size || 1) > p.stock) lines.push({ product: p, packs: 0, loose: p.stock })
+        else lines.push({ product: p, packs: 1, loose: 0 })
+      }
+      render()
+    },
+  }
+}
+
+const issueItemCost = (i) => i.line_cost ?? Math.round((i.qty || 0) * (i.unit_cost || 0))
+
+function issueSlipHtml(issue) {
+  const items = issue.items || []
+  return `<div class="issue-slip">
+    <h2>${esc(state.settings.pharmacy_name)}</h2>
+    <h3>Department issue slip — ${esc(issue.issue_no)}</h3>
+    <table class="slip-meta">
+      <tr><td>Date</td><td>${esc(issue.created_at)}</td><td>Department</td><td><b>${esc(issue.department_name)}</b></td></tr>
+      <tr><td>Received by</td><td>${esc(issue.received_by || '')}</td><td>Patient</td><td>${esc(issue.patient_name || '')}</td></tr>
+      <tr><td>Issued by</td><td>${esc(issue.user_name || state.user.full_name)}</td><td>Requisition</td><td>${issue.request_id ? `#${esc(issue.request_id)}` : ''}</td></tr>
+      ${issue.note ? `<tr><td>Note</td><td colspan="3">${esc(issue.note)}</td></tr>` : ''}
+    </table>
+    <table>
+      <thead><tr><th>Item</th><th>Batch</th><th>Expiry</th><th class="num">Qty</th><th class="num">Unit cost</th><th class="num">Cost</th></tr></thead>
+      <tbody>${items.map((i) => `<tr><td>${esc(i.product_name)} ${esc(i.strength || '')} ${schedBadge(i.schedule || 'otc')}</td><td>${esc(i.batch_no)}</td><td>${esc(i.expiry_date)}</td>
+        <td class="num">${esc(qtyText(i.qty, i.pack_size))}</td><td class="num">${rs(i.unit_cost)}</td><td class="num">${rs(issueItemCost(i))}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="5">Total cost</td><td class="num">${rs(issue.total_cost)}</td></tr></tfoot>
+    </table>
+    <div class="sign-row"><div>Issued by (pharmacy)</div><div>Received by (${esc(issue.department_name)})</div></div>
+  </div>`
+}
+
+function showIssueSlip(issue, onClose) {
+  const m = modal(`<div class="row"><h2 style="margin:0">Issue ${esc(issue.issue_no)} saved</h2><div class="spacer"></div><button id="slip-print" class="primary">Print slip</button></div>
+    <div class="panel" style="margin-top:12px;overflow-x:auto">${issueSlipHtml(issue)}</div>
+    <div class="actions"><button data-close>Close</button></div>`, { wide: true, onClose })
+  $('#slip-print', m.el).addEventListener('click', () => printHtml(issueSlipHtml(issue), 'report'))
+  return m
+}
+
+async function issuesView(view) {
+  const ctx = { tab: 'issue', departments: [] }
+  const TABS = [['issue', 'Issue'], ['requisitions', 'Requisitions'], ['issued', 'Issued'], ['departments', 'Departments']]
+  view.innerHTML = `<div class="stack">
+    <h1>Department issues</h1>
+    <div class="tabs" id="tabs">${TABS.map(([k, l]) => `<button data-t="${k}" class="${k === ctx.tab ? 'sel' : ''}">${l}</button>`).join('')}</div>
+    <div id="pane"></div></div>`
+  const pane = $('#pane', view)
+  const loadDepartments = async () => { ctx.departments = await get('/departments?all=1') }
+  const activeDepts = () => ctx.departments.filter((d) => d.active !== 0)
+  const deptOptions = (sel, blank) => `${blank ? `<option value="">${esc(blank)}</option>` : ''}${activeDepts().map((d) => `<option value="${d.id}" ${String(d.id) === String(sel) ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}`
+
+  // ----- Issue tab -----
+  const iss = { dept: '', request: '', requests: [], received: '', patient: '', note: '', lines: [], busy: false }
+
+  async function loadRequests() {
+    iss.requests = iss.dept
+      ? (await get(`/issue-requests?department_id=${iss.dept}`)).filter((r) => ['open', 'partial'].includes(r.status))
+      : []
+  }
+
+  // Replaces the lines with what is still owed on a requisition.
+  async function pickRequest(id) {
+    iss.request = id ? String(id) : ''
+    if (!id) return
+    const req = await get(`/issue-requests/${id}`)
+    iss.dept = String(req.department_id)
+    const items = (req.items || []).filter((it) => it.qty_requested - it.qty_issued > 0)
+    const prods = await Promise.all(items.map((it) => get(`/products/${it.product_id}`).catch(() => null)))
+    iss.lines = items.map((it, k) => {
+      const product = { id: it.product_id, name: it.product_name, strength: it.strength, form: it.form, schedule: 'otc', allow_loose: 1, ...(prods[k] || {}), pack_size: it.pack_size || prods[k]?.pack_size || 1, stock: it.stock ?? prods[k]?.stock ?? 0 }
+      const units = it.qty_requested - it.qty_issued
+      const ps = product.pack_size || 1
+      return { product, packs: Math.floor(units / ps), loose: units % ps, request_item_id: it.id, remaining: units }
+    })
+    // Received by is left for the person collecting the stock to be entered deliberately (controlled drugs need it).
+    await loadRequests()
+    if (!iss.requests.some((r) => String(r.id) === iss.request)) iss.requests.push(req)
+  }
+
+  function renderIssue() {
+    pane.innerHTML = `<form class="panel stack" id="issf" autocomplete="off">
+      <div class="grid">
+        <label class="field">Department *<select name="dept" required>${deptOptions(iss.dept, 'Choose department…')}</select></label>
+        <label class="field">Requisition (optional)<select name="request"><option value="">No requisition</option>
+          ${iss.requests.map((r) => `<option value="${r.id}" ${String(r.id) === iss.request ? 'selected' : ''}>#${r.id}${r.ref_no ? ' · ' + esc(r.ref_no) : ''} · ${esc(r.status)} · ${esc(String(r.created_at || '').slice(0, 10))}</option>`).join('')}</select></label>
+        <label class="field"><span id="recv-label">Received by</span><input name="received" value="${esc(iss.received)}"></label>
+        <label class="field">Patient name (optional)<input name="patient" value="${esc(iss.patient)}"></label>
+        <label class="field">Note<input name="note" value="${esc(iss.note)}"></label>
+      </div>
+      <div id="picker"></div>
+      <div id="lines"></div>
+      <div class="muted" style="font-size:13px">Issued stock is valued at cost, taken from the batches that expire first. Nothing is charged and no till is involved.</div>
+      <div class="alert" id="ctrl-note" hidden>This issue has a controlled drug. “Received by” is required.</div>
+      <div class="row"><div class="spacer"></div><button type="button" id="issue-clear">Clear</button><button class="primary" id="issue-save">Issue stock</button></div>
+    </form>`
+    const form = $('#issf', pane)
+    const grid = qtyGrid($('#lines', pane), iss.lines, {
+      checkStock: true,
+      extra: (l) => (l.request_item_id ? `· <b>requested, ${esc(qtyText(l.remaining, l.product.pack_size))} still owed</b>` : ''),
+      onChange: () => {
+        const ctrl = iss.lines.some((l) => l.product.schedule === 'controlled')
+        $('#ctrl-note', pane).hidden = !ctrl
+        $('#recv-label', pane).textContent = ctrl ? 'Received by *' : 'Received by'
+      },
+    })
+    grid.render()
+    const picker = itemPicker($('#picker', pane), (p) => grid.add(p))
+    form.elements.dept.addEventListener('change', guard(async (e) => {
+      iss.dept = e.target.value
+      iss.request = ''
+      iss.lines = iss.lines.filter((l) => !l.request_item_id)
+      await loadRequests()
+      renderIssue()
+    }))
+    form.elements.request.addEventListener('change', guard(async (e) => {
+      if (e.target.value) await pickRequest(e.target.value)
+      else iss.request = ''
+      if (!e.target.value) iss.lines = iss.lines.filter((l) => !l.request_item_id)
+      renderIssue()
+    }))
+    form.addEventListener('input', (e) => {
+      if (['received', 'patient', 'note'].includes(e.target.name)) iss[e.target.name] = e.target.value
+    })
+    $('#issue-clear', pane).addEventListener('click', () => {
+      Object.assign(iss, { request: '', received: '', patient: '', note: '', lines: [] })
+      renderIssue()
+    })
+    form.addEventListener('submit', guard(async (e) => {
+      e.preventDefault()
+      if (iss.busy) return
+      if (!iss.dept) throw new Error('Choose the department')
+      if (!iss.lines.length) throw new Error('Add at least one item')
+      if (iss.lines.some((l) => l.product.schedule === 'controlled') && !iss.received.trim()) throw new Error('Enter who received the controlled drug')
+      iss.busy = true
+      $('#issue-save', pane).disabled = true
+      try {
+        const res = await post('/issues', {
+          department_id: Number(iss.dept),
+          request_id: iss.request ? Number(iss.request) : undefined,
+          received_by: iss.received.trim(),
+          patient_name: iss.patient.trim(),
+          note: iss.note.trim(),
+          items: iss.lines.map((l) => ({ product_id: l.product.id, qty: lineUnits(l), request_item_id: l.request_item_id })),
+        })
+        const full = await get(`/issues/${res.id}`).catch(() => res)
+        Object.assign(iss, { request: '', requests: [], received: '', patient: '', note: '', lines: [] })
+        await loadRequests()
+        renderIssue()
+        showIssueSlip(full)
+      } finally {
+        iss.busy = false
+        const btn = $('#issue-save', pane)
+        if (btn) btn.disabled = false
+      }
+    }))
+    if (iss.dept) picker.focus()
+  }
+
+  // ----- Requisitions tab -----
+  async function renderRequisitions() {
+    const f = ctx.reqFilter || (ctx.reqFilter = { status: '', department_id: '' })
+    pane.innerHTML = `<div class="stack"><div class="row">
+      <label class="field">Status<select id="rf-status">${['', 'open', 'partial', 'closed', 'cancelled'].map((s) => `<option value="${s}" ${s === f.status ? 'selected' : ''}>${s || 'All'}</option>`).join('')}</select></label>
+      <label class="field">Department<select id="rf-dept">${deptOptions(f.department_id, 'All departments')}</select></label>
+      <div class="spacer"></div><button class="primary" id="req-add">New requisition</button></div>
+      <div class="panel table-wrap" id="reqlist"></div></div>`
+    const load = async () => {
+      const qs = new URLSearchParams(Object.entries(f).filter(([, v]) => v)).toString()
+      const rows = await get(`/issue-requests${qs ? `?${qs}` : ''}`)
+      $('#reqlist', pane).innerHTML = rows.length === 0 ? '<p class="muted">No requisitions.</p>' : `<table>
+        <thead><tr><th>#</th><th>Date</th><th>Department</th><th>Ref no</th><th>Requested by</th><th>Status</th><th class="num">Items</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr class="clickable" data-id="${r.id}"><td>${r.id}</td><td>${esc(String(r.created_at || '').slice(0, 10))}</td><td>${esc(r.department_name)}</td>
+          <td>${esc(r.ref_no || '')}</td><td>${esc(r.requested_by || '')}</td><td>${statusBadge(r.status)}</td><td class="num">${esc(r.item_count ?? '')}</td></tr>`).join('')}</tbody></table>`
+    }
+    $('#rf-status', pane).addEventListener('change', (e) => { f.status = e.target.value; load().catch((x) => toast(x.message, true)) })
+    $('#rf-dept', pane).addEventListener('change', (e) => { f.department_id = e.target.value; load().catch((x) => toast(x.message, true)) })
+    $('#req-add', pane).addEventListener('click', () => requisitionForm(load))
+    $('#reqlist', pane).addEventListener('click', guard(async (e) => {
+      const tr = e.target.closest('tr[data-id]')
+      if (tr) await requisitionDetail(Number(tr.dataset.id), load)
+    }))
+    await load()
+  }
+
+  function requisitionForm(onSaved) {
+    const lines = []
+    const m = modal(`<form id="rqf"><h2>New requisition</h2>
+      <div class="grid">
+        <label class="field">Department *<select name="department_id" required>${deptOptions('', 'Choose department…')}</select></label>
+        <label class="field">Requested by<input name="requested_by"></label>
+        <label class="field">Ref no<input name="ref_no"></label>
+        <label class="field">Note<input name="note"></label>
+      </div>
+      <div id="rq-picker" style="margin-top:12px"></div><div id="rq-lines" style="margin-top:8px"></div>
+      <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save requisition</button></div></form>`, { wide: true })
+    const grid = qtyGrid($('#rq-lines', m.el), lines)
+    grid.render()
+    itemPicker($('#rq-picker', m.el), (p) => grid.add(p))
+    $('#rqf', m.el).addEventListener('submit', guard(async (e) => {
+      e.preventDefault()
+      const d = formData(e.target)
+      if (!lines.length) throw new Error('Add at least one item')
+      await post('/issue-requests', {
+        department_id: Number(d.department_id), requested_by: d.requested_by, ref_no: d.ref_no, note: d.note,
+        items: lines.map((l) => ({ product_id: l.product.id, qty: lineUnits(l) })),
+      })
+      m.close()
+      toast('Requisition saved')
+      await onSaved()
+    }))
+  }
+
+  async function requisitionDetail(id, onChange) {
+    const r = await get(`/issue-requests/${id}`)
+    const live = ['open', 'partial'].includes(r.status)
+    const m = modal(`<div class="row"><h2 style="margin:0">Requisition #${r.id} — ${esc(r.department_name)}</h2>${statusBadge(r.status)}</div>
+      <p class="muted">${esc(String(r.created_at || '').slice(0, 10))}${r.requested_by ? ` · requested by ${esc(r.requested_by)}` : ''}${r.ref_no ? ` · ref ${esc(r.ref_no)}` : ''}${r.note ? ` · ${esc(r.note)}` : ''}</p>
+      <div class="table-wrap"><table><thead><tr><th>Item</th><th class="num">Requested</th><th class="num">Issued</th><th class="num">Still owed</th><th class="num">In stock</th></tr></thead>
+      <tbody>${(r.items || []).map((i) => `<tr><td>${esc(i.product_name)} ${esc(i.strength || '')}</td>
+        <td class="num">${esc(qtyText(i.qty_requested, i.pack_size))}</td><td class="num">${esc(qtyText(i.qty_issued, i.pack_size))}</td>
+        <td class="num">${esc(qtyText(Math.max(0, i.qty_requested - i.qty_issued), i.pack_size))}</td><td class="num">${esc(packsText(i.stock ?? 0, i.pack_size))}</td></tr>`).join('')}</tbody></table></div>
+      <div class="actions"><button data-close>Close</button>
+        ${live ? '<button class="danger" id="rq-cancel">Cancel requisition</button><button class="primary" id="rq-issue">Issue now</button>' : ''}</div>`, { wide: true })
+    $('#rq-issue', m.el)?.addEventListener('click', guard(async () => {
+      await pickRequest(r.id)
+      m.close()
+      showTab('issue')
+    }))
+    $('#rq-cancel', m.el)?.addEventListener('click', guard(async () => {
+      if (!confirm(`Cancel requisition #${r.id}?`)) return
+      await post(`/issue-requests/${r.id}/cancel`)
+      m.close()
+      toast('Requisition cancelled')
+      await onChange()
+    }))
+  }
+
+  // ----- Issued tab -----
+  async function renderIssued() {
+    const f = ctx.issuedFilter || (ctx.issuedFilter = { from: isoDaysAgo(30), to: today(), department_id: '' })
+    pane.innerHTML = `<div class="stack"><div class="row">
+      <label class="field">From<input type="date" id="if-from" value="${f.from}"></label>
+      <label class="field">To<input type="date" id="if-to" value="${f.to}"></label>
+      <label class="field">Department<select id="if-dept">${deptOptions(f.department_id, 'All departments')}</select></label></div>
+      <div class="panel table-wrap" id="issuedlist"></div></div>`
+    const load = async () => {
+      const qs = new URLSearchParams(Object.entries(f).filter(([, v]) => v)).toString()
+      const rows = await get(`/issues?${qs}`)
+      const sum = (k) => rows.reduce((t, r) => t + (r[k] || 0), 0)
+      $('#issuedlist', pane).innerHTML = rows.length === 0 ? '<p class="muted">No issues in this period.</p>' : `<table>
+        <thead><tr><th>Issue no</th><th>Date</th><th>Department</th><th>Received by</th><th class="num">Items</th><th class="num">Cost</th><th class="num">Returned</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr class="clickable" data-id="${r.id}"><td>${esc(r.issue_no)}</td><td>${esc(r.created_at)}</td><td>${esc(r.department_name)}</td><td>${esc(r.received_by || '')}</td>
+          <td class="num">${esc(r.item_count)}</td><td class="num">${rs(r.total_cost)}</td><td class="num">${r.returned_cost ? rs(r.returned_cost) : ''}</td></tr>`).join('')}</tbody>
+        <tfoot><tr><td colspan="5">Total</td><td class="num">${rs(sum('total_cost'))}</td><td class="num">${rs(sum('returned_cost'))}</td></tr></tfoot></table>`
+    }
+    const reload = () => load().catch((x) => toast(x.message, true))
+    $('#if-from', pane).addEventListener('change', (e) => { f.from = e.target.value; reload() })
+    $('#if-to', pane).addEventListener('change', (e) => { f.to = e.target.value; reload() })
+    $('#if-dept', pane).addEventListener('change', (e) => { f.department_id = e.target.value; reload() })
+    $('#issuedlist', pane).addEventListener('click', guard(async (e) => {
+      const tr = e.target.closest('tr[data-id]')
+      if (tr) await issueDetail(Number(tr.dataset.id), load)
+    }))
+    await load()
+  }
+
+  async function issueDetail(id, onChange) {
+    const issue = await get(`/issues/${id}`)
+    const items = issue.items || []
+    const returnable = items.some((i) => i.qty > (i.returned_qty || 0))
+    const m = modal(`<div class="row"><h2 style="margin:0">${esc(issue.issue_no)} — ${esc(issue.department_name)}</h2><div class="spacer"></div><button id="is-print">Print slip</button></div>
+      <p class="muted">${esc(issue.created_at)}${issue.received_by ? ` · received by ${esc(issue.received_by)}` : ''}${issue.patient_name ? ` · patient ${esc(issue.patient_name)}` : ''}${issue.request_id ? ` · requisition #${esc(issue.request_id)}` : ''}${issue.note ? ` · ${esc(issue.note)}` : ''}</p>
+      <form id="isret"><div class="table-wrap"><table>
+        <thead><tr><th>Item</th><th>Batch</th><th class="num">Issued</th><th class="num">Returned</th><th class="num">Cost</th>${returnable ? '<th>Return (units)</th>' : ''}</tr></thead>
+        <tbody>${items.map((i) => `<tr><td>${esc(i.product_name)} ${esc(i.strength || '')} ${schedBadge(i.schedule || 'otc')}</td>
+          <td>${esc(i.batch_no)} <span class="muted">${esc(i.expiry_date)}</span></td><td class="num">${esc(qtyText(i.qty, i.pack_size))}</td>
+          <td class="num">${i.returned_qty ? `${i.returned_qty} units` : ''}</td><td class="num">${rs(issueItemCost(i))}</td>
+          ${returnable ? `<td>${i.qty > (i.returned_qty || 0) ? `<input type="number" min="0" max="${i.qty - (i.returned_qty || 0)}" value="0" name="r${i.id}" aria-label="Return quantity (units)">` : ''}</td>` : ''}</tr>`).join('')}</tbody>
+        <tfoot><tr><td colspan="4">Total cost</td><td class="num">${rs(issue.total_cost)}</td>${returnable ? '<td></td>' : ''}</tr></tfoot></table></div>
+      ${(issue.returns || []).length ? `<h3>Returns</h3><ul>${issue.returns.map((r) => `<li>${esc(r.created_at)} — ${rs(r.total_cost)}${r.user_name ? ` by ${esc(r.user_name)}` : ''}${r.reason ? `: ${esc(r.reason)}` : ''}</li>`).join('')}</ul>` : ''}
+      ${returnable ? `<div class="row" style="margin-top:10px"><label class="field" style="flex:1">Return reason<input name="reason" placeholder="e.g. not needed, ward closed"></label>
+        <label class="row" style="font-size:13px"><input type="checkbox" name="restock" checked> Put back in stock</label></div>
+        <p class="muted" style="font-size:13px">Expired batches are never put back in stock.</p>` : ''}
+      <div class="actions"><button type="button" data-close>Close</button>${returnable ? '<button class="primary">Record return</button>' : ''}</div></form>`, { wide: true })
+    $('#is-print', m.el).addEventListener('click', () => printHtml(issueSlipHtml(issue), 'report'))
+    $('#isret', m.el).addEventListener('submit', guard(async (e) => {
+      e.preventDefault()
+      const d = formData(e.target)
+      const lines = items.map((i) => ({ issue_item_id: i.id, qty: Number(d[`r${i.id}`] || 0), restock: !!d.restock })).filter((i) => i.qty > 0)
+      if (!lines.length) throw new Error('Enter a quantity to return')
+      await post(`/issues/${id}/returns`, { items: lines, reason: d.reason })
+      m.close()
+      toast('Return recorded')
+      await onChange()
+    }))
+  }
+
+  // ----- Departments tab -----
+  async function renderDepartments() {
+    pane.innerHTML = `<div class="stack"><div class="row"><div class="spacer"></div><button class="primary" id="dept-add">Add department</button></div>
+      <div class="panel table-wrap" id="deptlist"></div></div>`
+    const draw = () => {
+      $('#deptlist', pane).innerHTML = ctx.departments.length === 0 ? '<p class="muted">No departments yet.</p>' : `<table>
+        <thead><tr><th>Name</th><th>In-charge</th><th>Status</th></tr></thead>
+        <tbody>${ctx.departments.map((d) => `<tr class="clickable" data-id="${d.id}"><td>${esc(d.name)}</td><td>${esc(d.incharge || '')}</td>
+          <td>${d.active !== 0 ? '<span class="badge ok">Active</span>' : '<span class="muted">Inactive</span>'}</td></tr>`).join('')}</tbody></table>`
+    }
+    const form = (d) => {
+      const m = modal(`<form id="df"><h2>${d ? 'Edit' : 'Add'} department</h2><div class="grid">
+        <label class="field">Name *<input name="name" value="${esc(d?.name)}" required></label>
+        <label class="field">In-charge<input name="incharge" value="${esc(d?.incharge)}"></label></div>
+        <label class="row" style="margin-top:10px"><input type="checkbox" name="active" ${d?.active !== 0 ? 'checked' : ''}> Active</label>
+        <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`)
+      $('#df', m.el).addEventListener('submit', guard(async (e) => {
+        e.preventDefault()
+        const v = formData(e.target)
+        const body = { name: v.name.trim(), incharge: v.incharge, active: v.active ? 1 : 0 }
+        if (d) await put(`/departments/${d.id}`, body)
+        else await post('/departments', body)
+        m.close()
+        toast('Department saved')
+        await loadDepartments()
+        draw()
+      }))
+    }
+    $('#dept-add', pane).addEventListener('click', () => form(null))
+    $('#deptlist', pane).addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-id]')
+      if (tr) form(ctx.departments.find((d) => d.id === Number(tr.dataset.id)))
+    })
+    draw()
+  }
+
+  async function showTab(tab) {
+    ctx.tab = tab
+    $$('#tabs button', view).forEach((x) => x.classList.toggle('sel', x.dataset.t === tab))
+    if (tab === 'issue') {
+      if (iss.dept && !iss.requests.length) await loadRequests()
+      renderIssue()
+    } else if (tab === 'requisitions') await renderRequisitions()
+    else if (tab === 'issued') await renderIssued()
+    else await renderDepartments()
+  }
+  $('#tabs', view).addEventListener('click', guard(async (e) => {
+    const b = e.target.closest('button[data-t]')
+    if (b) await showTab(b.dataset.t)
+  }))
+  await loadDepartments()
+  await showTab('issue')
+}
+
+// Department usage report: per department, then per product for one department.
+async function deptUsageReport(out, f, setTitle) {
+  const range = `from=${f.from}&to=${f.to}`
+  const period = f.from === f.to ? f.from : `${f.from} to ${f.to}`
+  const head = (cols) => `<thead><tr>${cols.map((h) => `<th class="${h.startsWith('#') ? 'num' : ''}">${esc(h.replace(/^#/, ''))}</th>`).join('')}</tr></thead>`
+  const show = async (dept) => {
+    if (!dept) {
+      const rows = await get(`/reports/department-usage?${range}`)
+      setTitle(`Department usage ${period}`)
+      const sum = (k) => rows.reduce((t, r) => t + (r[k] || 0), 0)
+      out.innerHTML = `<div class="panel table-wrap"><table>${head(['Department', '#Issues', '#Issued cost', '#Returned cost', '#Net cost'])}
+        <tbody>${rows.length ? rows.map((r) => `<tr class="clickable" data-dept="${r.department_id}" data-name="${esc(r.name)}"><td>${esc(r.name)}</td><td class="num">${r.issues}</td>
+          <td class="num">${rs(r.issued_cost)}</td><td class="num">${rs(r.returned_cost)}</td><td class="num">${rs(r.net_cost)}</td></tr>`).join('') : '<tr><td colspan="5" class="muted">Nothing issued in this period.</td></tr>'}</tbody>
+        <tfoot><tr><td>Total</td><td class="num">${sum('issues')}</td><td class="num">${rs(sum('issued_cost'))}</td><td class="num">${rs(sum('returned_cost'))}</td><td class="num">${rs(sum('net_cost'))}</td></tr></tfoot></table></div>
+        <p class="muted" style="font-size:13px">Click a department to see usage by product. Values are at cost.</p>`
+    } else {
+      const rows = await get(`/reports/department-usage?${range}&department_id=${dept.id}`)
+      setTitle(`Department usage — ${dept.name} ${period}`)
+      const sum = (k) => rows.reduce((t, r) => t + (r[k] || 0), 0)
+      out.innerHTML = `<div class="stack"><div class="row"><button class="link" data-back>← All departments</button><h3 style="margin:0">${esc(dept.name)}</h3></div>
+        <div class="panel table-wrap"><table>${head(['Product', '#Qty issued', '#Qty returned', '#Net cost'])}
+        <tbody>${rows.length ? rows.map((r) => `<tr><td>${esc(r.name)} ${esc(r.strength || '')}</td><td class="num">${r.qty_issued}</td><td class="num">${r.qty_returned || ''}</td><td class="num">${rs(r.net_cost)}</td></tr>`).join('') : '<tr><td colspan="4" class="muted">Nothing issued in this period.</td></tr>'}</tbody>
+        <tfoot><tr><td>Total</td><td class="num">${sum('qty_issued')}</td><td class="num">${sum('qty_returned')}</td><td class="num">${rs(sum('net_cost'))}</td></tr></tfoot></table></div></div>`
+    }
+  }
+  out.onclick = (e) => {
+    const tr = e.target.closest('tr[data-dept]')
+    if (tr) show({ id: tr.dataset.dept, name: tr.dataset.name }).catch((x) => toast(x.message, true))
+    else if (e.target.closest('[data-back]')) show(null).catch((x) => toast(x.message, true))
+  }
+  await show(null)
 }
 
 boot()

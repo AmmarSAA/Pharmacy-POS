@@ -186,3 +186,18 @@ table.dues a { color: var(--accent); text-decoration: none; }
   .modal { padding: 14px; }
   .note-row { grid-template-columns: 80px 64px 1fr; }
 }
+
+/* Owner panel, department issues */
+.issue-slip { color: #000; background: #fff; padding: 8px; font-size: 13px; }
+.issue-slip h2, .issue-slip h3 { margin: 0 0 6px; }
+.issue-slip table td, .issue-slip table th { color: #000; border-bottom: 1px solid #bbb; }
+.issue-slip .slip-meta { margin-bottom: 10px; }
+.issue-slip .slip-meta td { border: none; padding: 2px 8px 2px 0; }
+.issue-slip .sign-row { display: flex; gap: 40px; margin-top: 48px; }
+.issue-slip .sign-row div { flex: 1; border-top: 1px solid #000; padding-top: 4px; font-size: 12px; }
+tr.clickable:focus-visible td { outline: 2px solid var(--accent); }
+@media (max-width: 600px) {
+  .grid { grid-template-columns: 1fr; }
+  td input.qty { width: 56px; }
+  .issue-slip .sign-row { gap: 16px; }
+}

@@ -55,7 +55,7 @@ See the checklist below.
 
 ## Later (not in this round)
 
-Department issues/requisitions, purchase returns to supplier, purchase orders, double-entry
+Purchase returns to supplier, purchase orders, double-entry
 accounting (trial balance, income statement), barcode label printing, multiple godowns,
 full data migration from the MultiTec database.
 
@@ -90,7 +90,32 @@ Sign in at https://pharmacy.z88.tech as the owner, then:
    and dues report.
 8. **Staff**: add a cashier account and confirm they can sell but can't see purchases or suppliers.
 
-Tell us about anything that differs from how MultiTec did it, especially:
-- Refunds are always paid in cash from the drawer (also for card sales). Should card refunds go back to the card?
-- An opening balance counts as due on its opening date (so it may show as overdue straight away).
-- Do wards or departments draw stock from the pharmacy? (MultiTec "Issue" — not built yet.)
+## Round 2 (owner controls, policies, department issues)
+
+Answers from the pharmacy: protected settings wanted; card refunds and opening-balance due date
+should be configurable; department issues needed; MultiTec data to follow.
+
+- Owner: the account that set up the pharmacy is the owner. Only the owner changes policy settings
+  (password confirmed), adds or changes admins, sees the audit log, and can transfer ownership.
+- Policies (Owner panel): open till required; card/wallet refunds from the drawer or back to the
+  card/wallet; supplier opening balance due after credit days (default) or immediately; maximum
+  discount per role.
+- Department issues: departments, requisitions, issues at cost (first expiry first out) with a
+  printable slip, returns from departments, department usage report; controlled register shows
+  the department.
+- Tests: 66 on Node; workflow (9 steps) and API suites on the Cloudflare runtime; old database
+  upgraded in place (stock movement table rebuilt, history kept, first admin made owner);
+  browser check as owner, second admin and cashier.
+
+### Round 2 checklist
+
+1. Owner panel: review the policies; set the cashier/pharmacist discount limits you want.
+2. Add a second admin and sign in as them: policies are read-only, other admins can't be changed.
+3. Departments: add your wards (OT, Emergency, ...).
+4. Requisition → Issue now → print the slip; issue a controlled drug (needs "Received by").
+5. Return part of an issue; check Reports → Department usage.
+
+### Waiting on the pharmacy
+
+- MultiTec database for migration: attach the zipped `D_Multi-Tec_Data` folder (live data) to the chat
+  (`D_Multi-Tec_Datatesting` is the May 2021 test copy).
