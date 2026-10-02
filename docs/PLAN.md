@@ -115,7 +115,8 @@ should be configurable; department issues needed; MultiTec data to follow.
 4. Requisition → Issue now → print the slip; issue a controlled drug (needs "Received by").
 5. Return part of an issue; check Reports → Department usage.
 
-### Waiting on the pharmacy
+### MultiTec data
 
-- MultiTec database for migration: attach the zipped `D_Multi-Tec_Data` folder (live data) to the chat
-  (`D_Multi-Tec_Datatesting` is the May 2021 test copy).
+- Received a 14.8 MB `MultiTec_Data.MDF`: item master only (10,770 items, 417 manufacturers), no
+  stock, suppliers or history. Exported to an import CSV and import-tested (twice, idempotent) on the
+  Cloudflare runtime. Steps in `docs/MIGRATION.md`.
