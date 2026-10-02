@@ -48,4 +48,5 @@ export const requireRole = (...roles) => (req, res, next) => {
 }
 
 // Settings keys that must never be exposed or edited through the API.
-export const PRIVATE_SETTINGS = ['jwt_secret']
+// assistant_api_key: a Groq key saved by the owner (the GROQ_API_KEY secret takes precedence).
+export const PRIVATE_SETTINGS = ['jwt_secret', 'assistant_api_key']

@@ -1,5 +1,6 @@
 // Pharmacy POS front end. Plain ES modules, no build step.
 // Money from the API is integer paisa; everything shown to people is rupees.
+import { mountAssistant, assistantOwnerSection } from './assistant.js'
 
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
@@ -305,7 +306,13 @@ function renderShell() {
     state.user = null
     renderAuth()
   }))
+  mountAssistant(assistantContext())
   route()
+}
+
+// What the assistant module (public/assistant.js) may use from the app.
+function assistantContext() {
+  return { state, api, get, post, toast, esc, rs, modal, guard }
 }
 
 function route() {
@@ -1978,6 +1985,10 @@ async function ownerView(view) {
       <h2>Audit log</h2>
       <div class="table-wrap" id="audit"><p class="muted">Loading…</p></div>
     </div></div>`
+  // The assistant module adds its own owner section (key status, on/off).
+  const assistantEl = document.createElement('div')
+  $('.stack', view).append(assistantEl)
+  assistantOwnerSection(assistantEl, assistantContext())
 
   $('#policy', view).addEventListener('submit', guard(async (e) => {
     e.preventDefault()

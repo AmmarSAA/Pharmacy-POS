@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import { getSettings, transaction, PROTECTED_SETTINGS } from '../db.js'
+import { PRIVATE_SETTINGS } from '../auth.js'
 import { HttpError, badRequest, reqInt } from '../lib/http.js'
 import { audit } from '../lib/audit.js'
 
@@ -12,6 +13,7 @@ const PROTECTED_RULES = {
   max_discount_cashier_bps: 'bps',
   max_discount_pharmacist_bps: 'bps',
   max_discount_admin_bps: 'bps',
+  assistant_enabled: ['0', '1'],
 }
 
 export const requireOwner = (req, res, next) => {
@@ -51,7 +53,7 @@ export default function ownerRoutes(db) {
       if (Object.keys(changes).length) audit(db, req.user.id, 'settings.update', changes)
     })
     const s = getSettings(db)
-    delete s.jwt_secret
+    for (const k of PRIVATE_SETTINGS) delete s[k]
     res.json(s)
   })
 

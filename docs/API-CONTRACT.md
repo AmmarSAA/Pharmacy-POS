@@ -99,3 +99,39 @@ stock movement reasons now include `issue` and `issue_return`. `PROTECTED_SETTIN
   `{ product_id, name, qty_issued, qty_returned, net_cost }`.
 - Controlled-drug register includes `issue`/`issue_return` movements with `department_name`.
 - Roles: all issue/request/department-write routes admin + pharmacist.
+
+---
+
+# Round 3: role-based dashboard and in-app assistant
+
+Groundwork in place: `assistant_conversations` table (src/db.js), settings `assistant_enabled`
+(owner policy, '1' default) and private `assistant_api_key`; Worker secret `GROQ_API_KEY` (env var
+locally). Routes mounted at `/api/dashboard` (src/routes/dashboard.routes.js) and `/api/assistant`
+(src/routes/assistant.routes.js). Browser: `public/assistant.js` exports `mountAssistant(ctx)` (called
+after sign-in) and `assistantOwnerSection(el, ctx)` (inside the Owner panel); ctx = { state, api, get,
+post, toast, esc, rs, modal, guard }. JSON body limit is 3 MB.
+
+## Dashboard (Agent DB)
+`GET /dashboard` -> `{ role, is_owner, date, cards: {...}, lists: {...}, charts: {...} }`, content by role:
+- everyone: `my_till` (session + totals or null), `my_sales_today` { invoices, total }, `recent_sales` (own, last 10)
+- pharmacist/admin: `sales_today` { invoices, total, prescriptions, controlled }, `alerts` { low_stock,
+  near_expiry, expired, unpriced_items (pack_price 0 with stock or without) }, `open_requisitions`,
+  lists `expiring_soon` (10), `low_stock` (10)
+- admin/owner: `sales_today` vs `sales_yesterday`, `gross_profit_today`, `cash_in_open_tills`,
+  `supplier_dues` { balance, overdue }, `stock_value` { cost, retail }, chart `sales_7d`
+  [{ day, total, invoices }], `top_products_today` (5), `issues_today` { count, cost }
+- owner: `recent_audit` (5)
+
+## Assistant (Agent AS) — mirror ColdStore ERP's assistant (agent loop, approvals, voice)
+- `GET /assistant/status` -> { enabled, provider, model, source ('environment'|'settings'|null), voice }
+  plus for the owner `saved` { keyHint, updatedAt } | null.
+- `PUT /assistant/key` (owner, { apiKey, current_password }) verifies with Groq, stores in
+  `assistant_api_key`, audit logs; `DELETE /assistant/key` (owner, { current_password }).
+- `GET /assistant/conversations` (own, last 30), `POST /assistant/conversations { text, lang }`,
+  `GET /assistant/conversations/:id`, `POST /assistant/conversations/:id/messages { text, lang }`,
+  `POST /assistant/conversations/:id/step` (continue a running turn), `POST /assistant/conversations/:id/approve
+  { decisions: { [callId]: true|false } }`, `DELETE /assistant/conversations/:id`.
+  Conversation view: { id, title, status, provider, transcript: [{type: user|assistant|tool|approval|error, ...}],
+  pending: [{ id, name, details: [[label, value]], error }], retryAfterMs, updated_at }.
+- `POST /assistant/voice { audio (base64), mime, lang }` -> { text } (Groq Whisper, Urdu/English).
+- 503 when disabled (`assistant_enabled = '0'`) or no key.

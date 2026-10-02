@@ -15,6 +15,8 @@ import reportRoutes from './routes/reports.routes.js'
 import tillRoutes from './routes/tills.routes.js'
 import issueRoutes, { departmentRoutes, issueRequestRoutes } from './routes/issues.routes.js'
 import ownerRoutes from './routes/owner.routes.js'
+import dashboardRoutes from './routes/dashboard.routes.js'
+import assistantRoutes from './routes/assistant.routes.js'
 
 // publicDir: folder with the browser app on disk (Node).
 // staticFiles: { '/path': { type, body } } used instead when there is no file system (Cloudflare).
@@ -40,7 +42,8 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
       strictTransportSecurity: false,
     }),
   )
-  app.use(express.json({ limit: '1mb' }))
+  // 3 MB: voice notes for the assistant arrive base64-encoded in JSON.
+  app.use(express.json({ limit: '3mb' }))
   app.use(cookieParser())
 
   app.get('/healthz', (req, res) => {
@@ -64,6 +67,8 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
   api.use('/issue-requests', issueRequestRoutes(db))
   api.use('/issues', issueRoutes(db))
   api.use('/owner', ownerRoutes(db))
+  api.use('/dashboard', dashboardRoutes(db))
+  api.use('/assistant', assistantRoutes(db))
   api.use((req, res) => res.status(404).json({ message: 'Not found' }))
   app.use('/api', api)
 

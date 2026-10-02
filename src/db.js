@@ -307,6 +307,24 @@ CREATE TABLE IF NOT EXISTS issue_return_items (
   restocked        INTEGER NOT NULL DEFAULT 1
 );
 
+-- In-app assistant conversations (one row per conversation, per user).
+CREATE TABLE IF NOT EXISTS assistant_conversations (
+  id               INTEGER PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  title            TEXT NOT NULL,
+  provider         TEXT NOT NULL,
+  lang             TEXT NOT NULL DEFAULT 'en',
+  status           TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle', 'running', 'awaiting_approval')),
+  messages         TEXT NOT NULL DEFAULT '[]',  -- provider-native history (JSON)
+  transcript       TEXT NOT NULL DEFAULT '[]',  -- what the user sees (JSON)
+  pending          TEXT,                        -- actions waiting for approval (JSON)
+  steps_this_turn  INTEGER NOT NULL DEFAULT 0,
+  retry_after_ms   INTEGER NOT NULL DEFAULT 0,
+  created_at       TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}')),
+  updated_at       TEXT NOT NULL DEFAULT (datetime('now', '${clock.sqlModifier}'))
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_user ON assistant_conversations(user_id, updated_at);
+
 CREATE TABLE IF NOT EXISTS day_closes (
   id               INTEGER PRIMARY KEY,
   business_date    TEXT NOT NULL UNIQUE,
@@ -333,6 +351,7 @@ const DEFAULT_SETTINGS = {
   max_discount_cashier_bps: '1000',
   max_discount_pharmacist_bps: '2500',
   max_discount_admin_bps: '10000',
+  assistant_enabled: '1',               // in-app AI assistant on/off (owner)
   require_open_till: '1',
   default_sale_unit: 'pack',
   cash_denominations: '5000,1000,500,100,50,20,10,5,2,1',
@@ -456,6 +475,7 @@ export function transaction(db, fn) {
 export const PROTECTED_SETTINGS = [
   'require_open_till', 'refund_card_sales', 'opening_balance_due',
   'max_discount_cashier_bps', 'max_discount_pharmacist_bps', 'max_discount_admin_bps',
+  'assistant_enabled',
 ]
 
 export function getSettings(db) {
