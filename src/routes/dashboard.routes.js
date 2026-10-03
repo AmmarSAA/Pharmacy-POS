@@ -1,31 +1,31 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import { today, getSettings } from '../db.js'
 import { openTillFor, tillTotals } from '../lib/till.js'
-import { supplierDues, addDays } from '../lib/supplier-ledger.js'
+import { supplierDues, addDays, daysBetween } from '../lib/supplier-ledger.js'
 
 // Role-based home dashboard. See docs/API-CONTRACT.md (Round 3).
 // cashier: own till and sales only. pharmacist: + store sales, stock alerts, requisitions.
 // admin: + profit, cash in tills, supplier dues, stock value, 7-day chart. owner: + recent audit.
 
-// Sales are filtered on created_at ranges ('YYYY-MM-DD' <= created_at < next day) so the index is used;
-// this is the same as date(created_at) = day.
-const dayRange = (from, to) => ({ from, next: addDays(to, 1) })
+// created_at ranges ('YYYY-MM-DD' <= created_at < next day) use the created_at indexes.
+const dayRange = (from, to) => ({ created_at: { $gte: from, $lt: addDays(to, 1) } })
 
-function myTill(db, userId) {
-  const till = openTillFor(db, userId)
-  return till ? { session: till, totals: tillTotals(db, till.id) } : null
+async function myTill(db, userId) {
+  const till = await openTillFor(db, userId)
+  return till ? { session: till, totals: await tillTotals(db, till.id) } : null
 }
 
 // Per-day sales for [from, to] with zero days filled in.
-function salesByDay(db, from, to) {
-  const rows = db.prepare(
-    `SELECT substr(s.created_at, 1, 10) AS day, COUNT(*) AS invoices, COALESCE(SUM(s.total), 0) AS total,
-       COALESCE(SUM(s.tax), 0) AS tax, COUNT(s.prescription_id) AS prescriptions,
-       SUM(EXISTS (SELECT 1 FROM sale_items si JOIN products p ON p.id = si.product_id
-                   WHERE si.sale_id = s.id AND p.schedule = 'controlled')) AS controlled
-     FROM sales s WHERE s.created_at >= :from AND s.created_at < :next GROUP BY day`,
-  ).all(dayRange(from, to))
-  const byDay = new Map(rows.map((r) => [r.day, r]))
+async function salesByDay(db, from, to) {
+  const rows = await db.col('sales').aggregate([
+    { $match: dayRange(from, to) },
+    { $group: {
+      _id: { $substrBytes: ['$created_at', 0, 10] }, invoices: { $sum: 1 }, total: { $sum: '$total' }, tax: { $sum: '$tax' },
+      prescriptions: { $sum: { $cond: [{ $gt: ['$prescription_id', null] }, 1, 0] } },
+      controlled: { $sum: { $ifNull: ['$has_controlled', 0] } },
+    } },
+  ]).toArray()
+  const byDay = new Map(rows.map((r) => [r._id, r]))
   const out = []
   for (let d = from; d <= to; d = addDays(d, 1)) {
     const r = byDay.get(d)
@@ -36,25 +36,31 @@ function salesByDay(db, from, to) {
 }
 
 // Gross profit on goods for one day, same formula as /reports/summary (excludes GST).
-function grossProfit(db, day, sales) {
-  const p = dayRange(day, day)
-  const cost = db.prepare(
-    `SELECT COALESCE(SUM(si.unit_cost * si.qty), 0) AS v FROM sale_items si JOIN sales s ON s.id = si.sale_id
-     WHERE s.created_at >= :from AND s.created_at < :next`,
-  ).get(p).v
-  const ret = db.prepare(
-    `SELECT COALESCE(SUM(ri.tax), 0) AS tax, COALESCE(SUM(si.unit_cost * ri.qty), 0) AS cost
-     FROM return_items ri JOIN returns r ON r.id = ri.return_id JOIN sale_items si ON si.id = ri.sale_item_id
-     WHERE r.created_at >= :from AND r.created_at < :next`,
-  ).get(p)
-  const refunds = db.prepare('SELECT COALESCE(SUM(refund_total), 0) AS v FROM returns WHERE created_at >= :from AND created_at < :next').get(p).v
+async function grossProfit(db, day, sales) {
+  const when = dayRange(day, day)
+  const cost = (await db.col('sale_items').aggregate([
+    { $match: when }, { $group: { _id: null, v: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } },
+  ]).toArray())[0]?.v || 0
+  const ret = (await db.col('return_items').aggregate([
+    { $match: when }, { $group: { _id: null, tax: { $sum: '$tax' }, cost: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } },
+  ]).toArray())[0] || { tax: 0, cost: 0 }
+  const refunds = await db.sum('returns', when, 'refund_total')
   return (sales.total - refunds) - (sales.tax - ret.tax) - (cost - ret.cost)
+}
+
+// Unexpired stock per product, for the given products.
+async function stockFor(db, productIds, t) {
+  const rows = await db.col('batches').aggregate([
+    { $match: { product_id: { $in: productIds }, expiry_date: { $gte: t }, qty_on_hand: { $gt: 0 } } },
+    { $group: { _id: '$product_id', q: { $sum: '$qty_on_hand' } } },
+  ]).toArray()
+  return new Map(rows.map((r) => [r._id, r.q]))
 }
 
 export default function dashboardRoutes(db) {
   const r = Router()
 
-  r.get('/', (req, res) => {
+  r.get('/', async (req, res) => {
     const { role, id: userId } = req.user
     const isOwner = !!req.user.is_owner
     const staff = role === 'admin' || role === 'pharmacist'
@@ -66,98 +72,90 @@ export default function dashboardRoutes(db) {
     const charts = {}
 
     // Everyone: own till and own sales today.
-    cards.my_till = myTill(db, userId)
-    cards.my_sales_today = db.prepare(
-      `SELECT COUNT(*) AS invoices, COALESCE(SUM(total), 0) AS total FROM sales
-       WHERE user_id = :uid AND created_at >= :from AND created_at < :next`,
-    ).get({ ...tr, uid: userId })
+    cards.my_till = await myTill(db, userId)
+    const mine = { ...tr, user_id: userId }
+    cards.my_sales_today = { invoices: await db.col('sales').countDocuments(mine), total: await db.sum('sales', mine, 'total') }
     // Cashiers see only their own sales; supervisors see the latest across the pharmacy.
-    lists.recent_sales = db.prepare(
-      `SELECT s.id, s.invoice_no, s.created_at, s.customer_name, s.payment_method, s.total, s.prescription_id,
-         u.full_name AS cashier_name
-       FROM sales s JOIN users u ON u.id = s.user_id ${staff ? '' : 'WHERE s.user_id = ?'} ORDER BY s.created_at DESC, s.id DESC LIMIT 10`,
-    ).all(...(staff ? [] : [userId]))
+    const recent = await db.all('sales', staff ? {} : { user_id: userId }, {
+      sort: { created_at: -1, id: -1 }, limit: 10,
+      projection: { id: 1, invoice_no: 1, created_at: 1, customer_name: 1, payment_method: 1, total: 1, prescription_id: 1, user_id: 1 },
+    })
+    await db.join(recent, [{ key: 'user_id', from: 'users', fields: { cashier_name: 'full_name' } }])
+    lists.recent_sales = recent.map(({ user_id, ...s }) => s)
 
     if (staff) {
-      const days = salesByDay(db, addDays(t, -6), t)
+      const days = await salesByDay(db, addDays(t, -6), t)
       const td = days[6]
       const yd = days[5]
       cards.sales_today = { invoices: td.invoices, total: td.total, prescriptions: td.prescriptions, controlled: td.controlled }
 
       // Stock alerts. Stock counts only unexpired batches, as /reports/low-stock does.
-      const nearDays = Number(getSettings(db).near_expiry_days) || 90
-      const ep = { today: t, near: `+${nearDays} days` }
-      const stockCte = `WITH st AS (SELECT product_id, SUM(qty_on_hand) AS stock FROM batches
-        WHERE expiry_date >= :today AND qty_on_hand > 0 GROUP BY product_id)`
-      const prod = db.prepare(
-        `${stockCte} SELECT
-           COALESCE(SUM(COALESCE(p.pack_price, 0) = 0), 0) AS unpriced,
-           COALESCE(SUM(COALESCE(p.pack_price, 0) = 0 AND COALESCE(st.stock, 0) > 0), 0) AS unpriced_in_stock,
-           COALESCE(SUM(p.reorder_level > 0 AND COALESCE(st.stock, 0) <= p.reorder_level), 0) AS low_stock
-         FROM products p LEFT JOIN st ON st.product_id = p.id WHERE p.active = 1`,
-      ).get({ today: t })
-      const exp = db.prepare(
-        `SELECT COALESCE(SUM(expiry_date >= :today AND expiry_date <= date(:today, :near)), 0) AS near_expiry,
-           COALESCE(SUM(expiry_date < :today), 0) AS expired
-         FROM batches WHERE qty_on_hand > 0`,
-      ).get(ep)
+      const nearDays = Number((await getSettings(db)).near_expiry_days) || 90
+      const nearLimit = addDays(t, nearDays)
+      const products = db.col('products')
+      const unpricedFilter = { active: 1, $or: [{ pack_price: 0 }, { pack_price: null }] }
+      const unpriced = await products.countDocuments(unpricedFilter)
+      // Items in stock without a price: only products that have stock can count, so start from batches.
+      const inStock = await db.col('batches').distinct('product_id', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } })
+      const unpricedInStock = await products.countDocuments({ ...unpricedFilter, _id: { $in: inStock } })
+      const reorder = await db.all('products', { active: 1, reorder_level: { $gt: 0 } }, {
+        projection: { id: 1, name: 1, strength: 1, form: 1, pack_size: 1, reorder_level: 1 },
+      })
+      const stock = await stockFor(db, reorder.map((p) => p.id), t)
+      const low = reorder.map((p) => ({ ...p, stock: stock.get(p.id) || 0 })).filter((p) => p.stock <= p.reorder_level)
+        .sort((a, b) => a.stock - b.stock || String(a.name).localeCompare(String(b.name)))
+      const batches = db.col('batches')
       cards.alerts = {
-        low_stock: prod.low_stock, near_expiry: exp.near_expiry, expired: exp.expired,
-        unpriced_items: prod.unpriced, unpriced_in_stock: prod.unpriced_in_stock, near_expiry_days: nearDays,
+        low_stock: low.length,
+        near_expiry: await batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }),
+        expired: await batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $lt: t } }),
+        unpriced_items: unpriced, unpriced_in_stock: unpricedInStock, near_expiry_days: nearDays,
       }
-      cards.open_requisitions = db.prepare("SELECT COUNT(*) AS v FROM issue_requests WHERE status IN ('open', 'partial')").get().v
-      lists.expiring_soon = db.prepare(
-        `SELECT b.id, b.product_id, p.name AS product_name, p.strength, b.batch_no, b.expiry_date, b.qty_on_hand,
-           CAST(julianday(b.expiry_date) - julianday(:today) AS INTEGER) AS days_to_expiry
-         FROM batches b JOIN products p ON p.id = b.product_id
-         WHERE b.qty_on_hand > 0 AND b.expiry_date >= :today AND b.expiry_date <= date(:today, :near)
-         ORDER BY b.expiry_date, p.name LIMIT 10`,
-      ).all(ep)
-      lists.low_stock = db.prepare(
-        `${stockCte} SELECT p.id, p.name, p.strength, p.form, p.pack_size, p.reorder_level, COALESCE(st.stock, 0) AS stock
-         FROM products p LEFT JOIN st ON st.product_id = p.id
-         WHERE p.active = 1 AND p.reorder_level > 0 AND COALESCE(st.stock, 0) <= p.reorder_level
-         ORDER BY stock, p.name LIMIT 10`,
-      ).all({ today: t })
+      cards.open_requisitions = await db.col('issue_requests').countDocuments({ status: { $in: ['open', 'partial'] } })
+      const expiring = await db.all('batches', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }, {
+        sort: { expiry_date: 1, id: 1 }, limit: 10, projection: { id: 1, product_id: 1, batch_no: 1, expiry_date: 1, qty_on_hand: 1 },
+      })
+      await db.join(expiring, [{ key: 'product_id', from: 'products', fields: { product_name: 'name', strength: 'strength' } }])
+      lists.expiring_soon = expiring.map((b) => ({ ...b, days_to_expiry: daysBetween(t, b.expiry_date) }))
+      lists.low_stock = low.slice(0, 10)
 
       if (admin) {
         cards.sales_yesterday = { invoices: yd.invoices, total: yd.total }
-        cards.gross_profit_today = grossProfit(db, t, td)
-        const open = db.prepare("SELECT id FROM till_sessions WHERE status = 'open'").all()
-        cards.cash_in_open_tills = {
-          tills: open.length,
-          expected_cash: open.reduce((s, x) => s + (tillTotals(db, x.id)?.expected_cash || 0), 0),
-        }
-        const dues = [...supplierDues(db).values()]
+        cards.gross_profit_today = await grossProfit(db, t, td)
+        const open = await db.all('till_sessions', { status: 'open' }, { projection: { id: 1 } })
+        let expected = 0
+        for (const x of open) expected += (await tillTotals(db, x.id))?.expected_cash || 0
+        cards.cash_in_open_tills = { tills: open.length, expected_cash: expected }
+        const dues = [...(await supplierDues(db)).values()]
         cards.supplier_dues = {
           balance: dues.reduce((s, d) => s + d.balance, 0),
           overdue: dues.reduce((s, d) => s + d.overdue, 0),
           suppliers_overdue: dues.filter((d) => d.overdue > 0).length,
         }
-        cards.stock_value = db.prepare(
-          `SELECT COALESCE(SUM(qty_on_hand * cost_price), 0) AS cost, COALESCE(SUM(qty_on_hand * sale_price), 0) AS retail
-           FROM batches WHERE qty_on_hand > 0 AND expiry_date >= ?`,
-        ).get(t)
-        cards.issues_today = db.prepare(
-          'SELECT COUNT(*) AS count, COALESCE(SUM(total_cost), 0) AS cost FROM issues WHERE created_at >= :from AND created_at < :next',
-        ).get(tr)
+        const sv = (await batches.aggregate([
+          { $match: { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } } },
+          { $group: { _id: null, cost: { $sum: { $multiply: ['$qty_on_hand', '$cost_price'] } }, retail: { $sum: { $multiply: ['$qty_on_hand', '$sale_price'] } } } },
+        ]).toArray())[0]
+        cards.stock_value = { cost: sv?.cost || 0, retail: sv?.retail || 0 }
+        cards.issues_today = { count: await db.col('issues').countDocuments(tr), cost: await db.sum('issues', tr, 'total_cost') }
         charts.sales_7d = days.map((d) => ({ day: d.day, total: d.total, invoices: d.invoices }))
-        lists.top_products_today = db.prepare(
-          `SELECT p.id, p.name, p.strength, SUM(si.qty - si.returned_qty) AS qty, SUM(si.line_total) AS revenue
-           FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-           WHERE s.created_at >= :from AND s.created_at < :next GROUP BY p.id ORDER BY revenue DESC LIMIT 5`,
-        ).all(tr)
+        const top = (await db.col('sale_items').aggregate([
+          { $match: tr },
+          { $group: { _id: '$product_id', qty: { $sum: { $subtract: ['$qty', '$returned_qty'] } }, revenue: { $sum: '$line_total' } } },
+          { $sort: { revenue: -1 } }, { $limit: 5 },
+        ]).toArray()).map((x) => ({ id: x._id, qty: x.qty, revenue: x.revenue }))
+        await db.join(top, [{ key: 'id', from: 'products', fields: { name: 'name', strength: 'strength' } }])
+        lists.top_products_today = top.map(({ id, name, strength, qty, revenue }) => ({ id, name, strength, qty, revenue }))
       }
     }
 
     if (admin && isOwner) {
-      lists.recent_audit = db.prepare(
-        `SELECT a.id, a.created_at, a.action, a.detail, u.full_name AS user_name
-         FROM audit_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT 5`,
-      ).all().map((row) => {
+      const audit = await db.all('audit_log', {}, { sort: { id: -1 }, limit: 5 })
+      await db.join(audit, [{ key: 'user_id', from: 'users', fields: { user_name: 'full_name' } }])
+      lists.recent_audit = audit.map((row) => {
         let detail = row.detail
         try { detail = row.detail ? JSON.parse(row.detail) : null } catch { /* keep raw text */ }
-        return { ...row, detail }
+        return { id: row.id, created_at: row.created_at, action: row.action, detail, user_name: row.user_name }
       })
     }
 

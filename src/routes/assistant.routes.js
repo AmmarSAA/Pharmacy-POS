@@ -1,6 +1,6 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import bcrypt from 'bcryptjs'
-import { getSettings } from '../db.js'
+import { getSettings, setSetting } from '../db.js'
 import { HttpError, notFound } from '../lib/http.js'
 import { audit } from '../lib/audit.js'
 import { requireOwner } from './owner.routes.js'
@@ -20,8 +20,8 @@ const text = (req) => {
 }
 const lang = (req) => (req.body?.lang === 'ur' ? 'ur' : 'en')
 
-function confirmPassword(db, userId, password) {
-  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(userId)
+async function confirmPassword(db, userId, password) {
+  const row = await db.get('users', userId)
   if (!password || !bcrypt.compareSync(String(password), row.password_hash)) {
     throw new HttpError(403, 'Password is incorrect')
   }
@@ -30,14 +30,14 @@ function confirmPassword(db, userId, password) {
 export default function assistantRoutes(db) {
   const r = Router()
 
-  const enabled = () => getSettings(db).assistant_enabled !== '0'
+  const enabled = async () => (await getSettings(db)).assistant_enabled !== '0'
   // Conversation routes need the owner's switch on; the engine itself reports a missing key.
-  const requireOn = (req, res, next) => {
-    if (!enabled()) return next(new HttpError(503, 'The assistant is switched off. The owner can turn it on in the Owner panel.'))
+  const requireOn = async (req, res, next) => {
+    if (!(await enabled())) return next(new HttpError(503, 'The assistant is switched off. The owner can turn it on in the Owner panel.'))
     next()
   }
-  const own = (req) => {
-    const c = loadConversation(db, req.params.id, req.user.id)
+  const own = async (req) => {
+    const c = await loadConversation(db, req.params.id, req.user.id)
     if (!c) throw notFound('Conversation')
     return c
   }
@@ -50,19 +50,19 @@ export default function assistantRoutes(db) {
     }
   }
 
-  r.get('/status', (req, res) => {
-    const p = activeProvider(db)
-    const on = enabled()
+  r.get('/status', async (req, res) => {
+    const p = await activeProvider(db)
+    const on = await enabled()
     const body = {
       enabled: on && !!p,
       switched_on: on,
       provider: p?.name || null,
       model: p?.model() || null,
-      source: resolveKey(db).source,
-      voice: on && !!p && voiceAvailable(db),
+      source: (await resolveKey(db)).source,
+      voice: on && !!p && (await voiceAvailable(db)),
     }
     if (req.user.is_owner) {
-      const saved = savedKey(db)
+      const saved = await savedKey(db)
       body.saved = saved ? { keyHint: saved.hint, updatedAt: saved.updated_at } : null
     }
     res.json(body)
@@ -72,37 +72,35 @@ export default function assistantRoutes(db) {
   // when set, still takes precedence.
   r.put('/key', requireOwner, async (req, res, next) => {
     try {
-      confirmPassword(db, req.user.id, req.body?.current_password)
+      await confirmPassword(db, req.user.id, req.body?.current_password)
       const key = String(req.body?.apiKey || '').trim()
       if (key.length < 20 || /\s/.test(key)) throw new HttpError(400, 'Paste the full API key')
       if (!key.startsWith('gsk_')) throw new HttpError(400, 'A Groq key starts with gsk_')
       await keyCheck.verify(key)
-      const value = JSON.stringify({ sealed: seal(db, key), hint: hint(key), updated_at: new Date().toISOString() })
-      db.prepare(
-        "INSERT INTO settings (key, value) VALUES ('assistant_api_key', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      ).run(value)
-      audit(db, req.user.id, 'assistant.key', { saved: hint(key) })
-      res.json({ ok: true, saved: { keyHint: hint(key) }, source: resolveKey(db).source })
+      const value = JSON.stringify({ sealed: await seal(db, key), hint: hint(key), updated_at: new Date().toISOString() })
+      await setSetting(db, 'assistant_api_key', value)
+      await audit(db, req.user.id, 'assistant.key', { saved: hint(key) })
+      res.json({ ok: true, saved: { keyHint: hint(key) }, source: (await resolveKey(db)).source })
     } catch (err) {
       next(err)
     }
   })
 
-  r.delete('/key', requireOwner, (req, res) => {
-    confirmPassword(db, req.user.id, req.body?.current_password)
-    db.prepare("DELETE FROM settings WHERE key = 'assistant_api_key'").run()
-    audit(db, req.user.id, 'assistant.key', { removed: true })
-    res.json({ ok: true, source: resolveKey(db).source })
+  r.delete('/key', requireOwner, async (req, res) => {
+    await confirmPassword(db, req.user.id, req.body?.current_password)
+    await db.col('settings').deleteOne({ _id: 'assistant_api_key' })
+    await audit(db, req.user.id, 'assistant.key', { removed: true })
+    res.json({ ok: true, source: (await resolveKey(db)).source })
   })
 
-  r.get('/conversations', (req, res) => res.json(listConversations(db, req.user.id)))
-  r.get('/conversations/:id', (req, res) => res.json(view(own(req))))
+  r.get('/conversations', async (req, res) => res.json(await listConversations(db, req.user.id)))
+  r.get('/conversations/:id', async (req, res) => res.json(view(await own(req))))
   r.post('/conversations', requireOn, run((req) => startConversation(db, req.app, req.user, text(req), lang(req)), 201))
-  r.post('/conversations/:id/messages', requireOn, run((req) => sendMessage(db, req.app, own(req), req.user, text(req), lang(req))))
-  r.post('/conversations/:id/step', requireOn, run((req) => continueConversation(db, req.app, own(req), req.user)))
-  r.post('/conversations/:id/approve', requireOn, run((req) => decide(db, req.app, own(req), req.user, req.body?.decisions || {})))
-  r.delete('/conversations/:id', (req, res) => {
-    deleteConversation(db, own(req))
+  r.post('/conversations/:id/messages', requireOn, run(async (req) => sendMessage(db, req.app, await own(req), req.user, text(req), lang(req))))
+  r.post('/conversations/:id/step', requireOn, run(async (req) => continueConversation(db, req.app, await own(req), req.user)))
+  r.post('/conversations/:id/approve', requireOn, run(async (req) => decide(db, req.app, await own(req), req.user, req.body?.decisions || {})))
+  r.delete('/conversations/:id', async (req, res) => {
+    await deleteConversation(db, await own(req))
     res.json({ ok: true })
   })
 

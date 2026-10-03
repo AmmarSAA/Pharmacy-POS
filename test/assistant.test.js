@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 import { PROVIDERS, keyCheck } from '../src/assistant/providers.js'
 
@@ -20,13 +20,14 @@ PROVIDERS.fake.step = async ({ tools, history }) => {
 let server, base, db
 const tokens = {}
 before(async () => {
-  db = openDb(':memory:')
+  db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => {
+after(async () => {
   server.close()
+  await stopTestStore()
   delete process.env.AGENT_PROVIDER
 })
 
@@ -79,7 +80,7 @@ test('owner saves a key: verified, sealed, only a hint comes back', async () => 
     const r = await call('PUT', '/assistant/key', { apiKey: key, current_password: 'ownerpass1' })
     assert.equal(r.status, 200)
     assert.equal(r.body.saved.keyHint, '…WXYZ')
-    const stored = db.prepare("SELECT value FROM settings WHERE key = 'assistant_api_key'").get().value
+    const stored = (await db.col('settings').raw.findOne({ _id: 'assistant_api_key' })).value
     assert.ok(!stored.includes(key), 'key is not stored in plain text')
     assert.equal((await call('GET', '/settings')).body.assistant_api_key, undefined)
     assert.equal((await call('GET', '/assistant/status')).body.saved.keyHint, '…WXYZ')
@@ -133,7 +134,7 @@ test('cashiers are not offered staff tools and cannot use them', async () => {
   assert.ok(!seen.at(-2).tools.includes('record_supplier_payment'))
   assert.ok(seen.at(-2).tools.includes('search_products'))
   assert.match(seen.at(-1).last.content, /not available/i)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM supplier_payments').get().n, 0)
+  assert.equal(await db.col('supplier_payments').countDocuments(), 0)
 })
 
 test('conversations belong to their user', async () => {

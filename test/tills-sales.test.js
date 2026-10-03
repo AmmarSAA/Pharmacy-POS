@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 import { today } from '../src/db.js'
 
@@ -10,12 +10,15 @@ const tokens = {}
 const ids = {}
 
 before(async () => {
-  db = openDb(':memory:')
+  db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server?.close())
+after(async () => {
+  server?.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body, as = 'admin') {
   const res = await fetch(base + path, {
@@ -27,17 +30,15 @@ async function call(method, path, body, as = 'admin') {
 }
 
 const inDays = (n) => new Date(Date.now() + n * 864e5).toISOString().slice(0, 10)
-const stockOf = (batchId) => db.prepare('SELECT qty_on_hand FROM batches WHERE id = ?').get(batchId).qty_on_hand
+const stockOf = async (batchId) => (await db.get('batches', batchId)).qty_on_hand
 
 // Batches inserted directly so these tests don't depend on the purchase entry format.
 function addBatch(productId, batchNo, expiry, qty, packPrice, packSize) {
   const unit = packPrice === null ? 300 : Math.round(packPrice / packSize)
-  return Number(
-    db.prepare(
-      `INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price, qty_on_hand, pack_price, pack_size)
-       VALUES (?, ?, ?, 100, ?, ?, ?, ?)`,
-    ).run(productId, batchNo, expiry, unit, qty, packPrice, packSize).lastInsertRowid,
-  )
+  return put(db, 'batches', {
+    product_id: productId, batch_no: batchNo, expiry_date: expiry, cost_price: 100, sale_price: unit, qty_on_hand: qty,
+    pack_price: packPrice, pack_size: packSize,
+  })
 }
 
 test('setup: users and products', async () => {
@@ -55,18 +56,18 @@ test('setup: users and products', async () => {
   ids.strip = await mk({ name: 'Strip 14', pack_size: 14, pack_price: 22500, allow_loose: 1 })
   ids.box = await mk({ name: 'Box 10', pack_size: 10, pack_price: 10000, allow_loose: 0 })
   ids.legacy = await mk({ name: 'Legacy', sale_price: 300 })
-  ids.stripA = addBatch(ids.strip, 'A', inDays(30), 31, 22500, 14)
-  ids.stripB = addBatch(ids.strip, 'B', inDays(300), 100, 23800, 14)
-  ids.boxA = addBatch(ids.box, 'BX', inDays(300), 50, 10000, 10)
-  ids.legacyA = addBatch(ids.legacy, 'L', inDays(300), 50, null, null) // pre-migration shape
+  ids.stripA = await addBatch(ids.strip, 'A', inDays(30), 31, 22500, 14)
+  ids.stripB = await addBatch(ids.strip, 'B', inDays(300), 100, 23800, 14)
+  ids.boxA = await addBatch(ids.box, 'BX', inDays(300), 50, 10000, 10)
+  ids.legacyA = await addBatch(ids.legacy, 'L', inDays(300), 50, null, null) // pre-migration shape
 })
 
 test('a sale needs an open till; nothing changes until one is open', async () => {
   const blocked = await call('POST', '/sales', { items: [{ product_id: ids.strip, packs: 2 }], payment_method: 'card' })
   assert.equal(blocked.status, 409)
   assert.match(blocked.body.message, /Open your till/)
-  assert.equal(stockOf(ids.stripA), 31)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sales').get().n, 0)
+  assert.equal(await stockOf(ids.stripA), 31)
+  assert.equal(await db.col('sales').countDocuments(), 0)
   assert.equal((await call('GET', '/tills/current')).body.session, null)
   assert.equal((await call('POST', '/tills/current/movements', { direction: 'in', amount: 100, reason: 'x' })).status, 409)
 
@@ -100,8 +101,8 @@ test('loose units are pro rata per slice across batches', async () => {
     ['B', 2, Math.round((2 * 23800) / 14)],
   ])
   assert.equal(r.body.subtotal, 4821 + 3400)
-  assert.equal(stockOf(ids.stripA), 0)
-  assert.equal(stockOf(ids.stripB), 98)
+  assert.equal(await stockOf(ids.stripA), 0)
+  assert.equal(await stockOf(ids.stripB), 98)
 })
 
 test('packs + loose and duplicate lines are merged into units', async () => {
@@ -111,14 +112,14 @@ test('packs + loose and duplicate lines are merged into units', async () => {
   })
   assert.equal(r.status, 201, JSON.stringify(r.body))
   assert.deepEqual(r.body.items.map((i) => [i.batch_no, i.qty, i.line_total]), [['B', 17, Math.round((17 * 23800) / 14)]])
-  assert.equal(stockOf(ids.stripB), 81)
+  assert.equal(await stockOf(ids.stripB), 81)
 })
 
 test('loose units are refused when the item sells in full packs only', async () => {
   assert.equal((await call('POST', '/sales', { items: [{ product_id: ids.box, loose: 3 }], payment_method: 'card' })).status, 400)
   assert.equal((await call('POST', '/sales', { items: [{ product_id: ids.box, qty: 5 }], payment_method: 'card' })).status, 400)
   assert.equal((await call('POST', '/sales', { items: [{ product_id: ids.box, packs: 0 }], payment_method: 'card' })).status, 400)
-  assert.equal(stockOf(ids.boxA), 50)
+  assert.equal(await stockOf(ids.boxA), 50)
   const ok = await call('POST', '/sales', { items: [{ product_id: ids.box, packs: 1, loose: 0 }], payment_method: 'card' })
   assert.equal(ok.status, 201)
   assert.equal(ok.body.items[0].line_total, 10000)
@@ -167,11 +168,11 @@ test('a refund without an open till is refused', async () => {
   assert.equal((await call('POST', '/users', { username: 'pharm2', full_name: 'pharm2', role: 'pharmacist', password: 'password1' })).status, 201)
   tokens.pharm2 = (await call('POST', '/auth/login', { username: 'pharm2', password: 'password1' })).body.token
   const si = ids.pharmCardSale.items[0]
-  const before = stockOf(ids.legacyA)
+  const before = await stockOf(ids.legacyA)
   const r = await call('POST', `/sales/${ids.pharmCardSale.id}/returns`, { items: [{ sale_item_id: si.id, qty: 1 }], reason: 'x' }, 'pharm2')
   assert.equal(r.status, 409)
-  assert.equal(stockOf(ids.legacyA), before)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM returns').get().n, 1)
+  assert.equal(await stockOf(ids.legacyA), before)
+  assert.equal(await db.col('returns').countDocuments(), 1)
 })
 
 test('cash in/out validation and expected cash', async () => {
@@ -212,9 +213,9 @@ test('closing a till records counted cash and variance', async () => {
 })
 
 test('cashier sells only after opening a till', async () => {
-  const before = stockOf(ids.legacyA)
+  const before = await stockOf(ids.legacyA)
   assert.equal((await call('POST', '/sales', { items: [{ product_id: ids.legacy, qty: 1 }] }, 'cashier')).status, 409)
-  assert.equal(stockOf(ids.legacyA), before)
+  assert.equal(await stockOf(ids.legacyA), before)
   const open = await call('POST', '/tills/open', {}, 'cashier')
   assert.equal(open.status, 201)
   assert.equal(open.body.opening_cash, 0)
@@ -256,8 +257,8 @@ test('day close waits for every till, then locks the date', async () => {
   assert.equal(r.status, 201, JSON.stringify(r.body))
   const s = r.body.day_close.summary
   assert.equal(s.tills.length, 3)
-  assert.equal(s.sales.count, db.prepare('SELECT COUNT(*) AS n FROM sales').get().n)
-  assert.equal(s.sales.total, db.prepare('SELECT SUM(total) AS t FROM sales').get().t)
+  assert.equal(s.sales.count, await db.col('sales').countDocuments())
+  assert.equal(s.sales.total, await db.sum('sales', {}, 'total'))
   assert.equal(s.returns.total, 300)
   assert.equal(s.totals.cash_sales, 10000 + 300)
   assert.equal(s.totals.expected_cash, 100000 + 262700 + 300)

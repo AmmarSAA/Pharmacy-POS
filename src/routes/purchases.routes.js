@@ -1,6 +1,6 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
-import { transaction, today, getSettings } from '../db.js'
+import { today, getSettings } from '../db.js'
 import { HttpError, badRequest, notFound, reqInt, optInt, reqString, optString, reqDate, optDate, oneOf } from '../lib/http.js'
 import { packAmount, percentOf, priceForMargin } from '../lib/money.js'
 import { moveStock } from '../lib/stock.js'
@@ -11,11 +11,11 @@ const CASH_PURCHASE_METHODS = ['cash', 'till', 'bank']
 
 // One invoice line. Pack lines: { packs, loose_qty, bonus_qty, pack_cost, discount_bps, pack_price }.
 // Legacy unit lines: { qty, cost_price, sale_price } (per unit).
-function readLine(db, it, i, marginBps) {
+async function readLine(db, it, i, marginBps) {
   const n = `Line ${i + 1}`
   if (!it || typeof it !== 'object') throw badRequest(`${n}: item is not valid`)
   const productId = reqInt(it, 'product_id', { min: 1, label: `${n}: product` })
-  const product = db.prepare('SELECT id, name, pack_size, pack_price, sale_price FROM products WHERE id = ?').get(productId)
+  const product = await db.col('products').findOne({ _id: productId }, { projection: { id: 1, name: 1, pack_size: 1, pack_price: 1, sale_price: 1 } })
   if (!product) throw badRequest(`${n}: product not found`)
   const packSize = product.pack_size || 1
   const line = {
@@ -62,48 +62,48 @@ export default function purchaseRoutes(db) {
   const r = Router()
   r.use(requireRole('admin', 'pharmacist'))
 
-  const getPurchase = (id) => {
-    const p = db
-      .prepare(
-        `SELECT pu.*, s.name AS supplier_name, u.full_name AS received_by FROM purchases pu
-         JOIN suppliers s ON s.id = pu.supplier_id JOIN users u ON u.id = pu.user_id WHERE pu.id = ?`,
-      )
-      .get(id)
+  const getPurchase = async (id) => {
+    const p = await db.get('purchases', id)
     if (!p) throw notFound('Purchase')
-    p.items = db
-      .prepare(
-        `SELECT pi.*, b.product_id, b.batch_no, b.expiry_date, b.sale_price, b.pack_size, pr.name AS product_name
-         FROM purchase_items pi JOIN batches b ON b.id = pi.batch_id JOIN products pr ON pr.id = b.product_id
-         WHERE pi.purchase_id = ? ORDER BY pi.id`,
-      )
-      .all(p.id)
-    p.paid = db.prepare('SELECT COALESCE(SUM(amount), 0) AS v FROM supplier_payments WHERE purchase_id = ?').get(p.id).v
+    await db.join([p], [
+      { key: 'supplier_id', from: 'suppliers', fields: { supplier_name: 'name' } },
+      { key: 'user_id', from: 'users', fields: { received_by: 'full_name' } },
+    ])
+    const items = await db.all('purchase_items', { purchase_id: p.id }, { sort: { id: 1 } })
+    await db.join(items, [{ key: 'batch_id', from: 'batches', fields: {
+      product_id: 'product_id', batch_no: 'batch_no', expiry_date: 'expiry_date', sale_price: 'sale_price', pack_size: 'pack_size',
+    } }])
+    await db.join(items, [{ key: 'product_id', from: 'products', fields: { product_name: 'name' } }])
+    p.items = items
+    p.paid = await db.sum('supplier_payments', { purchase_id: p.id }, 'amount')
     return p
   }
 
   // Optional ?supplier_id=.
-  r.get('/', (req, res) => {
+  r.get('/', async (req, res) => {
     const sid = req.query.supplier_id ? Number(req.query.supplier_id) : null
-    res.json(
-      db.prepare(
-        `SELECT pu.*, s.name AS supplier_name, u.full_name AS received_by,
-           (SELECT COUNT(*) FROM purchase_items pi WHERE pi.purchase_id = pu.id) AS item_count
-         FROM purchases pu JOIN suppliers s ON s.id = pu.supplier_id JOIN users u ON u.id = pu.user_id
-         ${sid ? 'WHERE pu.supplier_id = ?' : ''}
-         ORDER BY pu.id DESC LIMIT 200`,
-      ).all(...(sid ? [sid] : [])),
-    )
+    const rows = await db.all('purchases', sid ? { supplier_id: sid } : {}, { sort: { id: -1 }, limit: 200 })
+    await db.join(rows, [
+      { key: 'supplier_id', from: 'suppliers', fields: { supplier_name: 'name' } },
+      { key: 'user_id', from: 'users', fields: { received_by: 'full_name' } },
+    ])
+    const counts = await db.col('purchase_items').aggregate([
+      { $match: { purchase_id: { $in: rows.map((r) => r.id) } } }, { $group: { _id: '$purchase_id', n: { $sum: 1 } } },
+    ]).toArray()
+    const byId = new Map(counts.map((c) => [c._id, c.n]))
+    for (const row of rows) row.item_count = byId.get(row.id) || 0
+    res.json(rows)
   })
 
-  r.get('/:id', (req, res) => {
-    res.json(getPurchase(Number(req.params.id)))
+  r.get('/:id', async (req, res) => {
+    res.json(await getPurchase(Number(req.params.id)))
   })
 
   // Receive stock against a supplier invoice. Each line creates or tops up a batch.
-  r.post('/', (req, res) => {
+  r.post('/', async (req, res) => {
     const body = req.body || {}
     const supplierId = reqInt(body, 'supplier_id', { min: 1, label: 'Supplier' })
-    const supplier = db.prepare('SELECT * FROM suppliers WHERE id = ?').get(supplierId)
+    const supplier = await db.get('suppliers', supplierId)
     if (!supplier) throw notFound('Supplier')
     const paymentType = oneOf(body.payment_type || 'credit', PAYMENT_TYPES, 'Payment type')
     const paymentMethod = paymentType === 'cash'
@@ -115,64 +115,59 @@ export default function purchaseRoutes(db) {
     const items = body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('Add at least one item')
 
-    const settings = getSettings(db)
+    const settings = await getSettings(db)
     const margin = Number(settings.default_margin_bps)
     const marginBps = Number.isFinite(margin) && settings.default_margin_bps !== '' ? margin : 1500
-    const lines = items.map((it, i) => readLine(db, it, i, marginBps))
-    const till = paymentMethod === 'till' ? tillForSupplierPayment(db, req.user.id) : null
+    const lines = []
+    for (const [i, it] of items.entries()) lines.push(await readLine(db, it, i, marginBps))
+    const till = paymentMethod === 'till' ? await tillForSupplierPayment(db, req.user.id) : null
 
-    const purchaseId = transaction(db, () => {
+    const purchaseId = await db.tx(async () => {
       const gross = lines.reduce((s, l) => s + l.gross, 0)
       const discount = lines.reduce((s, l) => s + l.discount, 0)
       const total = gross - discount
-      const { lastInsertRowid } = db
-        .prepare(
-          `INSERT INTO purchases (supplier_id, invoice_no, invoice_date, payment_type, due_date, gross, discount, total, notes, user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(supplierId, optString(body, 'invoice_no'), invoiceDate, paymentType, dueDate, gross, discount, total,
-          optString(body, 'notes'), req.user.id)
-      const purchaseId = Number(lastInsertRowid)
+      const purchaseId = await db.insert('purchases', {
+        supplier_id: supplierId, invoice_no: optString(body, 'invoice_no'), invoice_date: invoiceDate, payment_type: paymentType,
+        due_date: dueDate, gross, discount, total, notes: optString(body, 'notes'), user_id: req.user.id,
+      })
 
       for (const [i, l] of lines.entries()) {
-        let batch = db.prepare('SELECT * FROM batches WHERE product_id = ? AND batch_no = ?').get(l.product.id, l.batch_no)
+        let batch = await db.col('batches').findOne({ product_id: l.product.id, batch_no: l.batch_no })
         if (batch && batch.expiry_date !== l.expiry_date) {
           throw new HttpError(409, `Line ${i + 1}: ${l.product.name} batch ${l.batch_no} is already recorded with expiry ${batch.expiry_date}`)
         }
         if (!batch) {
-          const ins = db
-            .prepare(
-              `INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price, pack_price, pack_size)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            )
-            .run(l.product.id, l.batch_no, l.expiry_date, l.cost_price, l.sale_price, l.pack_price, l.pack_size)
-          batch = { id: Number(ins.lastInsertRowid) }
+          const id = await db.insert('batches', {
+            product_id: l.product.id, batch_no: l.batch_no, expiry_date: l.expiry_date, cost_price: l.cost_price,
+            sale_price: l.sale_price, pack_price: l.pack_price, pack_size: l.pack_size, qty_on_hand: 0,
+          })
+          batch = { id }
         } else {
-          db.prepare('UPDATE batches SET cost_price = ?, sale_price = ?, pack_price = ?, pack_size = ? WHERE id = ?')
-            .run(l.cost_price, l.sale_price, l.pack_price, l.pack_size, batch.id)
+          await db.col('batches').updateOne({ _id: batch.id }, {
+            $set: { cost_price: l.cost_price, sale_price: l.sale_price, pack_price: l.pack_price, pack_size: l.pack_size },
+          })
         }
         const received = l.units + l.bonus_qty
-        db.prepare(
-          `INSERT INTO purchase_items (purchase_id, batch_id, qty, cost_price, line_total, packs, loose_qty, bonus_qty,
-             pack_cost, discount_bps, pack_price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(purchaseId, batch.id, received, l.cost_price, l.net, l.packs, l.loose_qty, l.bonus_qty, l.pack_cost,
-          l.discount_bps, l.pack_price)
-        moveStock(db, { batchId: batch.id, change: received, reason: 'purchase', refId: purchaseId, userId: req.user.id,
+        await db.insert('purchase_items', {
+          purchase_id: purchaseId, batch_id: batch.id, qty: received, cost_price: l.cost_price, line_total: l.net,
+          packs: l.packs, loose_qty: l.loose_qty, bonus_qty: l.bonus_qty, pack_cost: l.pack_cost,
+          discount_bps: l.discount_bps, pack_price: l.pack_price,
+        })
+        await moveStock(db, { batchId: batch.id, change: received, reason: 'purchase', refId: purchaseId, userId: req.user.id,
           note: l.bonus_qty ? `incl. ${l.bonus_qty} bonus` : null })
-        db.prepare('UPDATE products SET pack_price = ?, sale_price = ? WHERE id = ?').run(l.pack_price, l.sale_price, l.product.id)
+        await db.col('products').updateOne({ _id: l.product.id }, { $set: { pack_price: l.pack_price, sale_price: l.sale_price } })
       }
 
       // A cash purchase is paid on the spot.
       if (paymentType === 'cash' && total > 0) {
-        recordSupplierPayment(db, {
+        await recordSupplierPayment(db, {
           supplier, amount: total, method: paymentMethod, paidOn: billDate, purchaseId,
           note: `Cash purchase ${optString(body, 'invoice_no') || `#${purchaseId}`}`, userId: req.user.id, till,
         })
       }
       return purchaseId
     })
-    res.status(201).json(getPurchase(purchaseId))
+    res.status(201).json(await getPurchase(purchaseId))
   })
 
   return r

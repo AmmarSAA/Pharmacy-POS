@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url'
 import helmet from 'helmet'
 import cookieParser from 'cookie-parser'
 import { authenticate } from './auth.js'
+import { Router } from './lib/router.js'
 import authRoutes from './routes/auth.routes.js'
 import userRoutes from './routes/users.routes.js'
 import settingsRoutes from './routes/settings.routes.js'
@@ -46,12 +47,16 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
   app.use(express.json({ limit: '3mb' }))
   app.use(cookieParser())
 
-  app.get('/healthz', (req, res) => {
-    db.prepare('SELECT 1').get()
-    res.json({ ok: true })
+  app.get('/healthz', async (req, res, next) => {
+    try {
+      await db.ping()
+      res.json({ ok: true })
+    } catch (err) {
+      next(err)
+    }
   })
 
-  const api = express.Router()
+  const api = Router()
   api.use('/auth', authRoutes(db))
   api.use(authenticate(db))
   api.use('/users', userRoutes(db))
@@ -83,6 +88,8 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
 
   app.use((err, req, res, next) => {
     if (err.type === 'entity.parse.failed') return res.status(400).json({ message: 'Invalid JSON' })
+    // Unique index hit (two requests creating the same thing at once).
+    if (err.code === 11000) return res.status(409).json({ message: 'That already exists' })
     const status = err.status || 500
     if (status >= 500) console.error(err)
     res.status(status).json({ message: status >= 500 ? 'Something went wrong' : err.message })

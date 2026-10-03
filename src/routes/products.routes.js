@@ -1,21 +1,48 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
-import { today, getSettings } from '../db.js'
-import { transaction } from '../db.js'
+import { today, nowStamp, getSettings } from '../db.js'
 import { HttpError, badRequest, notFound, reqString, optString, reqInt, optInt, oneOf } from '../lib/http.js'
 
 export const SCHEDULES = ['otc', 'rx', 'controlled']
 
-// Sellable stock excludes expired batches.
-const STOCK_SQL = `
-  SELECT p.*,
-    COALESCE((SELECT SUM(qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.expiry_date >= :today), 0) AS stock,
-    (SELECT MIN(expiry_date) FROM batches b WHERE b.product_id = p.id AND b.qty_on_hand > 0 AND b.expiry_date >= :today) AS next_expiry,
-    (SELECT sale_price FROM batches b WHERE b.product_id = p.id AND b.qty_on_hand > 0 AND b.expiry_date >= :today
-       ORDER BY expiry_date, id LIMIT 1) AS current_price,
-    (SELECT pack_price FROM batches b WHERE b.product_id = p.id AND b.qty_on_hand > 0 AND b.expiry_date >= :today
-       ORDER BY expiry_date, id LIMIT 1) AS current_pack_price
-  FROM products p`
+// Sellable stock excludes expired batches. Adds stock, next_expiry, current_price, current_pack_price.
+export const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+export function stockStages(onDate) {
+  return [
+    {
+      $lookup: {
+        from: 'batches',
+        let: { pid: '$id' },
+        pipeline: [
+          { $match: { $expr: { $and: [{ $eq: ['$product_id', '$$pid'] }, { $gte: ['$expiry_date', onDate] }] } } },
+          { $sort: { expiry_date: 1, id: 1 } },
+          { $project: { _id: 0, qty_on_hand: 1, expiry_date: 1, sale_price: 1, pack_price: 1 } },
+        ],
+        as: '_b',
+      },
+    },
+    {
+      $set: {
+        stock: { $sum: '$_b.qty_on_hand' },
+        _live: { $filter: { input: '$_b', cond: { $gt: ['$$this.qty_on_hand', 0] } } },
+      },
+    },
+    {
+      $set: {
+        next_expiry: { $ifNull: [{ $first: '$_live.expiry_date' }, null] },
+        current_price: { $ifNull: [{ $first: '$_live.sale_price' }, null] },
+        current_pack_price: { $ifNull: [{ $first: '$_live.pack_price' }, null] },
+      },
+    },
+    { $project: { _id: 0, _b: 0, _live: 0, name_lc: 0 } },
+  ]
+}
+
+export async function productsWithStock(db, match, { sort = { name: 1 }, limit = 0, onDate = today() } = {}) {
+  const pipeline = [{ $match: match }, { $sort: sort }]
+  if (limit) pipeline.push({ $limit: limit })
+  return db.col('products').aggregate([...pipeline, ...stockStages(onDate)]).toArray()
+}
 
 const COLUMNS = ['name', 'generic_name', 'barcode', 'manufacturer', 'form', 'strength', 'category', 'pack_size',
   'schedule', 'gst_rate_bps', 'reorder_level', 'sale_price', 'pack_price', 'packing', 'allow_loose', 'shelf_location', 'active']
@@ -63,100 +90,109 @@ function readImportRow(row, defaults) {
 
 export default function productRoutes(db) {
   const r = Router()
+  const products = db.col('products')
+  const PLAIN = { projection: { name_lc: 0 } }
 
   // ?q= searches name, generic, barcode. ?all=1 includes inactive.
-  r.get('/', (req, res) => {
+  r.get('/', async (req, res) => {
     const q = (req.query.q || '').trim()
-    const where = []
-    const params = { today: today() }
-    if (!req.query.all) where.push('p.active = 1')
+    const match = {}
+    if (!req.query.all) match.active = 1
     if (q) {
       // Item codes (MultiTec ph1234) match by prefix, so "ph51" finds ph5152.
-      where.push('(p.name LIKE :q OR p.generic_name LIKE :q OR p.barcode LIKE :prefix)')
-      params.q = `%${q}%`
-      params.prefix = `${q}%`
+      const any = new RegExp(escapeRegex(q), 'i')
+      match.$or = [{ name: any }, { generic_name: any }, { barcode: new RegExp('^' + escapeRegex(q), 'i') }]
     }
     // Large limits are for pick lists (purchase grid); a hospital pharmacy stocks several thousand items.
     const limit = Math.min(Number(req.query.limit) || 50, 20000)
-    const sql = `${STOCK_SQL} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY (p.barcode = :exact2) DESC, p.name LIMIT ${limit}`
-    params.exact2 = q || null
-    res.json(db.prepare(sql).all(params))
+    let rows
+    if (q) {
+      // An exact item code / barcode comes first.
+      const exact = await productsWithStock(db, { ...match, barcode: q }, { limit: 1 })
+      const rest = await productsWithStock(db, { ...match, barcode: { $ne: q } }, { limit })
+      rows = [...exact, ...rest].slice(0, limit)
+    } else {
+      rows = await productsWithStock(db, match, { limit })
+    }
+    res.json(rows)
   })
 
   // Lightweight list for pick lists (purchase grid): no stock figures, only what a line needs.
-  r.get('/pick', (req, res) => {
-    res.json(
-      db.prepare(
-        `SELECT id, name, strength, form, barcode, pack_size, pack_price, sale_price, allow_loose, packing, active
-         FROM products ${req.query.all ? '' : 'WHERE active = 1'} ORDER BY name`,
-      ).all(),
-    )
+  r.get('/pick', async (req, res) => {
+    res.json(await products.find(req.query.all ? {} : { active: 1 }, {
+      projection: { id: 1, name: 1, strength: 1, form: 1, barcode: 1, pack_size: 1, pack_price: 1, sale_price: 1, allow_loose: 1, packing: 1, active: 1 },
+      sort: { name: 1 },
+    }).toArray())
   })
 
   // Exact barcode match, used by scanners.
-  r.get('/barcode/:code', (req, res) => {
-    const p = db.prepare(`${STOCK_SQL} WHERE p.barcode = :code AND p.active = 1`).get({ today: today(), code: req.params.code })
+  r.get('/barcode/:code', async (req, res) => {
+    const [p] = await productsWithStock(db, { barcode: req.params.code, active: 1 }, { limit: 1 })
     if (!p) throw notFound('Product with that barcode')
     res.json(p)
   })
 
-  r.get('/:id', (req, res) => {
-    const p = db.prepare(`${STOCK_SQL} WHERE p.id = :id`).get({ today: today(), id: Number(req.params.id) })
+  r.get('/:id', async (req, res) => {
+    const [p] = await productsWithStock(db, { _id: Number(req.params.id) }, { limit: 1 })
     if (!p) throw notFound('Product')
-    p.batches = db
-      .prepare('SELECT * FROM batches WHERE product_id = ? AND qty_on_hand > 0 ORDER BY expiry_date, id')
-      .all(p.id)
+    p.batches = await db.col('batches').find({ product_id: p.id, qty_on_hand: { $gt: 0 } }, { sort: { expiry_date: 1, id: 1 } }).toArray()
     res.json(p)
   })
 
-  const defaults = () => ({ gst: Number(getSettings(db).default_gst_rate_bps) || 0 })
+  const defaults = async () => ({ gst: Number((await getSettings(db)).default_gst_rate_bps) || 0 })
 
-  const assertBarcodeFree = (barcode, id = 0) => {
-    if (barcode && db.prepare('SELECT 1 FROM products WHERE barcode = ? AND id != ?').get(barcode, id)) {
+  const assertBarcodeFree = async (barcode, id = 0) => {
+    if (barcode && (await products.findOne({ barcode, _id: { $ne: id } }))) {
       throw new HttpError(409, 'Another product already uses that barcode')
     }
   }
 
-  const insert = (p) =>
-    db.prepare(`INSERT INTO products (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map((c) => ':' + c).join(', ')})`).run(p)
+  const insert = (p) => db.insert('products', { ...p, name_lc: p.name.toLowerCase() })
 
-  r.post('/', requireRole('admin', 'pharmacist'), (req, res) => {
-    const p = readProduct(req.body, defaults())
-    assertBarcodeFree(p.barcode)
-    const { lastInsertRowid } = insert(p)
-    res.status(201).json(db.prepare('SELECT * FROM products WHERE id = ?').get(lastInsertRowid))
+  r.post('/', requireRole('admin', 'pharmacist'), async (req, res) => {
+    const p = readProduct(req.body, await defaults())
+    await assertBarcodeFree(p.barcode)
+    const id = await insert(p)
+    res.status(201).json(await products.findOne({ _id: id }, PLAIN))
   })
 
-  r.put('/:id', requireRole('admin', 'pharmacist'), (req, res) => {
+  r.put('/:id', requireRole('admin', 'pharmacist'), async (req, res) => {
     const id = Number(req.params.id)
-    if (!db.prepare('SELECT 1 FROM products WHERE id = ?').get(id)) throw notFound('Product')
-    const p = readProduct(req.body, defaults())
-    assertBarcodeFree(p.barcode, id)
-    db.prepare(`UPDATE products SET ${COLUMNS.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id`).run({ ...p, id })
-    res.json(db.prepare('SELECT * FROM products WHERE id = ?').get(id))
+    if (!(await products.findOne({ _id: id }))) throw notFound('Product')
+    const p = readProduct(req.body, await defaults())
+    await assertBarcodeFree(p.barcode, id)
+    await products.updateOne({ _id: id }, { $set: { ...p, name_lc: p.name.toLowerCase() } })
+    res.json(await products.findOne({ _id: id }, PLAIN))
   })
 
   // Bulk import from an item list (e.g. MultiTec export). Matches existing items by barcode/item
   // code, otherwise by exact name; updates them, creates the rest. Bad rows are reported, not fatal.
-  r.post('/import', requireRole('admin', 'pharmacist'), (req, res) => {
+  r.post('/import', requireRole('admin', 'pharmacist'), async (req, res) => {
     const rows = req.body.rows
     if (!Array.isArray(rows) || rows.length === 0) throw badRequest('No rows to import')
     if (rows.length > 2000) throw badRequest('Import at most 2000 rows at a time')
-    const d = defaults()
+    const d = await defaults()
     const result = { created: 0, updated: 0, errors: [] }
-    transaction(db, () => {
-      rows.forEach((row, i) => {
-        let p
-        try {
-          p = readImportRow(row, d)
-        } catch (err) {
-          result.errors.push({ row: i + 1, message: err.message })
-          return
-        }
-        const existing =
-          (p.barcode && db.prepare('SELECT * FROM products WHERE barcode = ?').get(p.barcode)) ||
-          (!p.barcode && db.prepare('SELECT * FROM products WHERE name = ? COLLATE NOCASE').get(p.name))
+    // Read the matching products in two queries, then write in one batch.
+    const parsed = rows.map((row, i) => {
+      try {
+        return { row, p: readImportRow(row, d) }
+      } catch (err) {
+        result.errors.push({ row: i + 1, message: err.message })
+        return null
+      }
+    }).filter(Boolean)
+    const codes = [...new Set(parsed.filter((x) => x.p.barcode).map((x) => x.p.barcode))]
+    const names = [...new Set(parsed.filter((x) => !x.p.barcode).map((x) => x.p.name.toLowerCase()))]
+    const byCode = new Map((await products.find({ barcode: { $in: codes } }).toArray()).map((p) => [p.barcode, p]))
+    const byName = new Map()
+    for (const p of await products.find({ name_lc: { $in: names } }, { sort: { id: 1 } }).toArray()) {
+      if (!byName.has(p.name_lc)) byName.set(p.name_lc, p)
+    }
+    const ops = []
+    const creates = []
+    for (const { row, p } of parsed) {
+        const existing = p.barcode ? byCode.get(p.barcode) : byName.get(p.name.toLowerCase())
         if (existing) {
           // Only overwrite what the file actually carries (e.g. keep a price set in the app).
           const has = (k) => row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== ''
@@ -166,15 +202,28 @@ export default function productRoutes(db) {
             merged.pack_price = has('pack_price') || has('sale_price') ? p.pack_price : existing.pack_price
             merged.sale_price = Math.round(merged.pack_price / merged.pack_size)
           }
-          db.prepare(`UPDATE products SET ${COLUMNS.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id`)
-            .run(Object.fromEntries([...COLUMNS.map((c) => [c, merged[c]]), ['id', existing.id]]))
+          const set = Object.fromEntries(COLUMNS.map((c) => [c, merged[c] ?? null]))
+          set.name_lc = String(set.name).toLowerCase()
+          Object.assign(existing, set)
+          // A row created earlier in this same file is simply amended before it is inserted.
+          if (!existing._new) ops.push({ updateOne: { filter: { _id: existing.id }, update: { $set: set } } })
           result.updated++
         } else {
-          insert(p)
+          const doc = { _new: true, created_at: nowStamp(), ...p, name_lc: p.name.toLowerCase() }
+          creates.push(doc)
+          if (p.barcode) byCode.set(p.barcode, doc)
+          else byName.set(doc.name_lc, doc)
           result.created++
         }
-      })
-    })
+    }
+    if (creates.length) {
+      let id = await db.reserveIds('products', creates.length)
+      for (const { _new, ...doc } of creates) {
+        ops.push({ insertOne: { document: { _id: id, id, ...doc } } })
+        id++
+      }
+    }
+    if (ops.length) await products.bulkWrite(ops, { ordered: false })
     res.json(result)
   })
 

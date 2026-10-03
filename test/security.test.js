@@ -1,19 +1,20 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 
 let server, base
 
 before(async () => {
   process.env.SETUP_TOKEN = 'let-me-in'
-  server = createApp(openDb(':memory:')).listen(0)
+  server = createApp(await testStore()).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}`
 })
-after(() => {
+after(async () => {
   delete process.env.SETUP_TOKEN
   server.close()
+  await stopTestStore()
 })
 
 const post = async (path, body) => {

@@ -1,62 +1,51 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
 import { today, getSettings } from '../db.js'
-import { supplierDues } from '../lib/supplier-ledger.js'
+import { supplierDues, addDays, daysBetween } from '../lib/supplier-ledger.js'
 
 function range(req) {
   const from = req.query.from || today()
   const to = req.query.to || from
   return { from, to }
 }
+// created_at is 'YYYY-MM-DD HH:MM:SS'; '~' sorts after any time, so this covers whole days.
+export const between = (from, to) => ({ created_at: { $gte: from, $lt: `${to}~` } })
 
 export default function reportRoutes(db) {
   const r = Router()
   r.use(requireRole('admin', 'pharmacist'))
+  const agg = (name, pipeline) => db.col(name).aggregate(pipeline).toArray()
+  const one = async (name, pipeline) => (await agg(name, pipeline))[0] || {}
 
   // Sales summary for a date range, with payment and GST breakdowns.
-  r.get('/summary', (req, res) => {
+  r.get('/summary', async (req, res) => {
     const { from, to } = range(req)
-    const p = { from, to }
-    const sales = db.prepare(
-      `SELECT COUNT(*) AS invoices, COALESCE(SUM(subtotal), 0) AS gross, COALESCE(SUM(discount), 0) AS discount,
-         COALESCE(SUM(tax), 0) AS tax, COALESCE(SUM(round_off), 0) AS round_off, COALESCE(SUM(total), 0) AS total
-       FROM sales WHERE date(created_at) BETWEEN :from AND :to`,
-    ).get(p)
-    const cost = db.prepare(
-      `SELECT COALESCE(SUM(si.unit_cost * si.qty), 0) AS cost FROM sale_items si JOIN sales s ON s.id = si.sale_id
-       WHERE date(s.created_at) BETWEEN :from AND :to`,
-    ).get(p).cost
-    const returns = db.prepare(
-      `SELECT COUNT(*) AS count, COALESCE(SUM(refund_total), 0) AS total,
-         COALESCE((SELECT SUM(ri.tax) FROM return_items ri JOIN returns r2 ON r2.id = ri.return_id
-                   WHERE date(r2.created_at) BETWEEN :from AND :to), 0) AS tax
-       FROM returns WHERE date(created_at) BETWEEN :from AND :to`,
-    ).get(p)
-    const returnedCost = db.prepare(
-      `SELECT COALESCE(SUM(si.unit_cost * ri.qty), 0) AS cost FROM return_items ri
-       JOIN returns r2 ON r2.id = ri.return_id JOIN sale_items si ON si.id = ri.sale_item_id
-       WHERE date(r2.created_at) BETWEEN :from AND :to`,
-    ).get(p).cost
-    const byPayment = db.prepare(
-      `SELECT payment_method, COUNT(*) AS invoices, SUM(total) AS total FROM sales
-       WHERE date(created_at) BETWEEN :from AND :to GROUP BY payment_method`,
-    ).all(p)
-    const byGstRate = db.prepare(
-      `SELECT si.gst_rate_bps, SUM(si.line_total) AS sales, SUM(si.tax) AS tax FROM sale_items si
-       JOIN sales s ON s.id = si.sale_id WHERE date(s.created_at) BETWEEN :from AND :to
-       GROUP BY si.gst_rate_bps ORDER BY si.gst_rate_bps`,
-    ).all(p)
-    const byUser = db.prepare(
-      `SELECT u.full_name, COUNT(*) AS invoices, SUM(s.total) AS total FROM sales s JOIN users u ON u.id = s.user_id
-       WHERE date(s.created_at) BETWEEN :from AND :to GROUP BY u.id ORDER BY total DESC`,
-    ).all(p)
-    const byDay = db.prepare(
-      `SELECT date(created_at) AS day, COUNT(*) AS invoices, SUM(total) AS total FROM sales
-       WHERE date(created_at) BETWEEN :from AND :to GROUP BY day ORDER BY day`,
-    ).all(p)
+    const when = between(from, to)
+    const s = await one('sales', [{ $match: when }, { $group: {
+      _id: null, invoices: { $sum: 1 }, gross: { $sum: '$subtotal' }, discount: { $sum: '$discount' },
+      tax: { $sum: '$tax' }, round_off: { $sum: '$round_off' }, total: { $sum: '$total' },
+    } }])
+    const sales = { invoices: s.invoices || 0, gross: s.gross || 0, discount: s.discount || 0, tax: s.tax || 0, round_off: s.round_off || 0, total: s.total || 0 }
+    const cost = (await one('sale_items', [{ $match: when }, { $group: { _id: null, v: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } }])).v || 0
+    const ret = await one('returns', [{ $match: when }, { $group: { _id: null, count: { $sum: 1 }, total: { $sum: '$refund_total' } } }])
+    const ri = await one('return_items', [{ $match: when }, { $group: {
+      _id: null, tax: { $sum: '$tax' }, cost: { $sum: { $multiply: ['$unit_cost', '$qty'] } },
+    } }])
+    const returns = { count: ret.count || 0, total: ret.total || 0, tax: ri.tax || 0 }
+    const returnedCost = ri.cost || 0
+    const byPayment = (await agg('sales', [{ $match: when }, { $group: { _id: '$payment_method', invoices: { $sum: 1 }, total: { $sum: '$total' } } }]))
+      .map((x) => ({ payment_method: x._id, invoices: x.invoices, total: x.total }))
+    const byGstRate = (await agg('sale_items', [{ $match: when }, { $group: { _id: '$gst_rate_bps', sales: { $sum: '$line_total' }, tax: { $sum: '$tax' } } }, { $sort: { _id: 1 } }]))
+      .map((x) => ({ gst_rate_bps: x._id, sales: x.sales, tax: x.tax }))
+    const byUser = await db.join((await agg('sales', [{ $match: when }, { $group: { _id: '$user_id', invoices: { $sum: 1 }, total: { $sum: '$total' } } }, { $sort: { total: -1 } }]))
+      .map((x) => ({ user_id: x._id, invoices: x.invoices, total: x.total })), [{ key: 'user_id', from: 'users', fields: { full_name: 'full_name' } }])
+    const byDay = (await agg('sales', [{ $match: when }, { $group: { _id: { $substrBytes: ['$created_at', 0, 10] }, invoices: { $sum: 1 }, total: { $sum: '$total' } } }, { $sort: { _id: 1 } }]))
+      .map((x) => ({ day: x._id, invoices: x.invoices, total: x.total }))
     const netSales = sales.total - returns.total
     res.json({
-      from, to, sales, returns, byPayment, byGstRate, byUser, byDay,
+      from, to, sales, returns, byPayment, byGstRate,
+      byUser: byUser.map(({ user_id, ...u }) => u),
+      byDay,
       net_sales: netSales,
       net_tax: sales.tax - returns.tax,
       // Gross profit on goods (excludes GST): revenue net of tax minus cost of goods sold.
@@ -66,42 +55,60 @@ export default function reportRoutes(db) {
     })
   })
 
-  r.get('/top-products', (req, res) => {
+  r.get('/top-products', async (req, res) => {
     const { from, to } = range(req)
-    res.json(
-      db.prepare(
-        `SELECT p.id, p.name, p.strength, SUM(si.qty - si.returned_qty) AS qty,
-           SUM(si.line_total) AS revenue, SUM(si.line_total - si.tax - si.unit_cost * si.qty) AS profit
-         FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-         WHERE date(s.created_at) BETWEEN ? AND ? GROUP BY p.id ORDER BY revenue DESC LIMIT 50`,
-      ).all(from, to),
-    )
+    const rows = (await agg('sale_items', [
+      { $match: between(from, to) },
+      { $group: {
+        _id: '$product_id',
+        qty: { $sum: { $subtract: ['$qty', '$returned_qty'] } },
+        revenue: { $sum: '$line_total' },
+        profit: { $sum: { $subtract: [{ $subtract: ['$line_total', '$tax'] }, { $multiply: ['$unit_cost', '$qty'] }] } },
+      } },
+      { $sort: { revenue: -1 } }, { $limit: 50 },
+    ])).map((x) => ({ id: x._id, qty: x.qty, revenue: x.revenue, profit: x.profit }))
+    await db.join(rows, [{ key: 'id', from: 'products', fields: { name: 'name', strength: 'strength' } }])
+    res.json(rows.map(({ id, name, strength, qty, revenue, profit }) => ({ id, name, strength, qty, revenue, profit })))
   })
 
-  r.get('/low-stock', (req, res) => {
-    res.json(
-      db.prepare(
-        `SELECT p.id, p.name, p.strength, p.form, p.reorder_level,
-           COALESCE((SELECT SUM(qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.expiry_date >= :today), 0) AS stock
-         FROM products p WHERE p.active = 1 AND p.reorder_level > 0
-         AND stock <= p.reorder_level ORDER BY stock, p.name`,
-      ).all({ today: today() }),
-    )
-  })
-
-  r.get('/stock-valuation', (req, res) => {
+  r.get('/low-stock', async (req, res) => {
     const t = today()
-    const rows = db.prepare(
-      `SELECT p.id, p.name, p.strength, SUM(b.qty_on_hand) AS qty,
-         SUM(b.qty_on_hand * b.cost_price) AS cost_value, SUM(b.qty_on_hand * b.sale_price) AS retail_value
-       FROM batches b JOIN products p ON p.id = b.product_id
-       WHERE b.qty_on_hand > 0 AND b.expiry_date >= ? GROUP BY p.id ORDER BY cost_value DESC`,
-    ).all(t)
-    const expired = db.prepare(
-      'SELECT COALESCE(SUM(qty_on_hand * cost_price), 0) AS v FROM batches WHERE qty_on_hand > 0 AND expiry_date < ?',
-    ).get(t).v
+    const rows = await agg('products', [
+      { $match: { active: 1, reorder_level: { $gt: 0 } } },
+      { $lookup: {
+        from: 'batches', let: { pid: '$id' },
+        pipeline: [
+          { $match: { $expr: { $and: [{ $eq: ['$product_id', '$$pid'] }, { $gte: ['$expiry_date', t] }] } } },
+          { $group: { _id: null, q: { $sum: '$qty_on_hand' } } },
+        ],
+        as: 'b',
+      } },
+      { $set: { stock: { $ifNull: [{ $first: '$b.q' }, 0] } } },
+      { $match: { $expr: { $lte: ['$stock', '$reorder_level'] } } },
+      { $sort: { stock: 1, name: 1 } },
+      { $project: { _id: 0, id: 1, name: 1, strength: 1, form: 1, reorder_level: 1, stock: 1 } },
+    ])
+    res.json(rows)
+  })
+
+  r.get('/stock-valuation', async (req, res) => {
+    const t = today()
+    const rows = (await agg('batches', [
+      { $match: { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } } },
+      { $group: {
+        _id: '$product_id', qty: { $sum: '$qty_on_hand' },
+        cost_value: { $sum: { $multiply: ['$qty_on_hand', '$cost_price'] } },
+        retail_value: { $sum: { $multiply: ['$qty_on_hand', '$sale_price'] } },
+      } },
+      { $sort: { cost_value: -1 } },
+    ])).map((x) => ({ id: x._id, qty: x.qty, cost_value: x.cost_value, retail_value: x.retail_value }))
+    await db.join(rows, [{ key: 'id', from: 'products', fields: { name: 'name', strength: 'strength' } }])
+    const expired = (await one('batches', [
+      { $match: { qty_on_hand: { $gt: 0 }, expiry_date: { $lt: t } } },
+      { $group: { _id: null, v: { $sum: { $multiply: ['$qty_on_hand', '$cost_price'] } } } },
+    ])).v || 0
     res.json({
-      rows,
+      rows: rows.map(({ id, name, strength, qty, cost_value, retail_value }) => ({ id, name, strength, qty, cost_value, retail_value })),
       cost_value: rows.reduce((s, r) => s + r.cost_value, 0),
       retail_value: rows.reduce((s, r) => s + r.retail_value, 0),
       expired_cost_value: expired,
@@ -110,94 +117,89 @@ export default function reportRoutes(db) {
 
   // Controlled-drug register: every movement of a controlled product with running batch balance
   // and, for sales, the patient and prescriber on record.
-  r.get('/controlled-register', (req, res) => {
+  r.get('/controlled-register', async (req, res) => {
     const { from, to } = range(req)
-    const params = { from, to }
-    let extra = ''
-    if (req.query.product_id) {
-      extra = 'AND m.product_id = :pid'
-      params.pid = Number(req.query.product_id)
-    }
-    res.json(
-      db.prepare(
-        `SELECT m.id, m.created_at, m.reason, m.change, m.balance, m.note, p.name AS product_name, p.strength,
-           b.batch_no, b.expiry_date, u.full_name AS user_name,
-           s.invoice_no, rx.patient_name, rx.patient_cnic, rx.prescriber_name, rx.prescriber_reg_no,
-           su.name AS supplier_name, pu.invoice_no AS supplier_invoice,
-           CASE WHEN m.reason = 'issue' THEN di.name WHEN m.reason = 'issue_return' THEN dr.name END AS department_name
-         FROM stock_movements m
-         JOIN products p ON p.id = m.product_id JOIN batches b ON b.id = m.batch_id JOIN users u ON u.id = m.user_id
-         LEFT JOIN sales s ON m.reason = 'sale' AND s.id = m.ref_id
-         LEFT JOIN prescriptions rx ON rx.id = s.prescription_id
-         LEFT JOIN purchases pu ON m.reason = 'purchase' AND pu.id = m.ref_id
-         LEFT JOIN suppliers su ON su.id = pu.supplier_id
-         LEFT JOIN issues iss ON m.reason = 'issue' AND iss.id = m.ref_id
-         LEFT JOIN departments di ON di.id = iss.department_id
-         LEFT JOIN issue_returns irt ON m.reason = 'issue_return' AND irt.id = m.ref_id
-         LEFT JOIN issues iss2 ON iss2.id = irt.issue_id
-         LEFT JOIN departments dr ON dr.id = iss2.department_id
-         WHERE p.schedule = 'controlled' AND date(m.created_at) BETWEEN :from AND :to ${extra}
-         ORDER BY m.id`,
-      ).all(params),
-    )
+    const controlled = await db.col('products').distinct('id', { schedule: 'controlled' })
+    const filter = { ...between(from, to), product_id: { $in: controlled } }
+    if (req.query.product_id) filter.product_id = { $in: controlled.filter((id) => id === Number(req.query.product_id)) }
+    const rows = await db.all('stock_movements', filter, { sort: { id: 1 } })
+    await db.join(rows, [
+      { key: 'product_id', from: 'products', fields: { product_name: 'name', strength: 'strength' } },
+      { key: 'batch_id', from: 'batches', fields: { batch_no: 'batch_no', expiry_date: 'expiry_date' } },
+      { key: 'user_id', from: 'users', fields: { user_name: 'full_name' } },
+    ])
+    const ref = (reason) => rows.map((m) => ({ ...m, _ref: m.reason === reason ? m.ref_id : null }))
+    const sales = await db.join(ref('sale'), [{ key: '_ref', from: 'sales', fields: { invoice_no: 'invoice_no', _rx: 'prescription_id' } }])
+    await db.join(sales, [{ key: '_rx', from: 'prescriptions', fields: {
+      patient_name: 'patient_name', patient_cnic: 'patient_cnic', prescriber_name: 'prescriber_name', prescriber_reg_no: 'prescriber_reg_no',
+    } }])
+    const purchases = await db.join(ref('purchase'), [{ key: '_ref', from: 'purchases', fields: { supplier_invoice: 'invoice_no', _sup: 'supplier_id' } }])
+    await db.join(purchases, [{ key: '_sup', from: 'suppliers', fields: { supplier_name: 'name' } }])
+    const issues = await db.join(ref('issue'), [{ key: '_ref', from: 'issues', fields: { _dept: 'department_id' } }])
+    const issueReturns = await db.join(ref('issue_return'), [{ key: '_ref', from: 'issue_returns', fields: { _iss: 'issue_id' } }])
+    await db.join(issueReturns, [{ key: '_iss', from: 'issues', fields: { _dept: 'department_id' } }])
+    const deptRows = rows.map((m, i) => ({ _dept: m.reason === 'issue' ? issues[i]._dept : m.reason === 'issue_return' ? issueReturns[i]._dept : null }))
+    await db.join(deptRows, [{ key: '_dept', from: 'departments', fields: { department_name: 'name' } }])
+    res.json(rows.map((m, i) => ({
+      id: m.id, created_at: m.created_at, reason: m.reason, change: m.change, balance: m.balance, note: m.note,
+      product_name: m.product_name, strength: m.strength, batch_no: m.batch_no, expiry_date: m.expiry_date, user_name: m.user_name,
+      invoice_no: sales[i].invoice_no, patient_name: sales[i].patient_name, patient_cnic: sales[i].patient_cnic,
+      prescriber_name: sales[i].prescriber_name, prescriber_reg_no: sales[i].prescriber_reg_no,
+      supplier_name: purchases[i].supplier_name, supplier_invoice: purchases[i].supplier_invoice,
+      department_name: deptRows[i].department_name,
+    })))
   })
 
   // Stock issued to departments, valued at cost. Without department_id: one row per department;
   // with it: one row per product.
-  r.get('/department-usage', (req, res) => {
+  r.get('/department-usage', async (req, res) => {
     const { from, to } = range(req)
-    const params = { from, to }
     if (req.query.department_id) {
-      params.dept = Number(req.query.department_id)
-      return res.json(
-        db.prepare(
-          `SELECT p.id AS product_id, p.name, SUM(ii.qty) AS qty_issued, SUM(ii.returned_qty) AS qty_returned,
-             SUM(ii.line_cost) - SUM(ii.unit_cost * ii.returned_qty) AS net_cost
-           FROM issue_items ii JOIN issues i ON i.id = ii.issue_id JOIN products p ON p.id = ii.product_id
-           WHERE i.department_id = :dept AND date(i.created_at) BETWEEN :from AND :to
-           GROUP BY p.id ORDER BY p.name`,
-        ).all(params),
-      )
+      const dept = Number(req.query.department_id)
+      const rows = (await agg('issue_items', [
+        { $match: { ...between(from, to), department_id: dept } },
+        { $group: {
+          _id: '$product_id', qty_issued: { $sum: '$qty' }, qty_returned: { $sum: '$returned_qty' },
+          line_cost: { $sum: '$line_cost' }, returned_cost: { $sum: { $multiply: ['$unit_cost', '$returned_qty'] } },
+        } },
+      ])).map((x) => ({ product_id: x._id, qty_issued: x.qty_issued, qty_returned: x.qty_returned, net_cost: x.line_cost - x.returned_cost }))
+      await db.join(rows, [{ key: 'product_id', from: 'products', fields: { name: 'name' } }])
+      rows.sort((a, b) => String(a.name).localeCompare(String(b.name)))
+      return res.json(rows.map(({ product_id, name, qty_issued, qty_returned, net_cost }) => ({ product_id, name, qty_issued, qty_returned, net_cost })))
     }
-    const issued = db.prepare(
-      `SELECT d.id AS department_id, d.name, COUNT(i.id) AS issues, COALESCE(SUM(i.total_cost), 0) AS issued_cost
-       FROM departments d JOIN issues i ON i.department_id = d.id
-       WHERE date(i.created_at) BETWEEN :from AND :to GROUP BY d.id`,
-    ).all(params)
-    const returnedRows = db.prepare(
-      `SELECT d.id, d.name, COALESCE(SUM(r.total_cost), 0) AS cost
-       FROM issue_returns r JOIN issues i ON i.id = r.issue_id JOIN departments d ON d.id = i.department_id
-       WHERE date(r.created_at) BETWEEN :from AND :to GROUP BY d.id`,
-    ).all(params)
+    const issued = (await agg('issues', [
+      { $match: between(from, to) },
+      { $group: { _id: '$department_id', issues: { $sum: 1 }, issued_cost: { $sum: '$total_cost' } } },
+    ])).map((x) => ({ department_id: x._id, issues: x.issues, issued_cost: x.issued_cost }))
+    const returnedRows = (await agg('issue_returns', [
+      { $match: between(from, to) },
+      { $group: { _id: '$department_id', cost: { $sum: '$total_cost' } } },
+    ])).map((x) => ({ id: x._id, cost: x.cost }))
     const returned = new Map(returnedRows.map((x) => [x.id, x.cost]))
     // Departments with only returns in the range still show up.
     for (const x of returnedRows) {
-      if (!issued.some((d) => d.department_id === x.id)) issued.push({ department_id: x.id, name: x.name, issues: 0, issued_cost: 0 })
+      if (!issued.some((d) => d.department_id === x.id)) issued.push({ department_id: x.id, issues: 0, issued_cost: 0 })
     }
+    await db.join(issued, [{ key: 'department_id', from: 'departments', fields: { name: 'name' } }])
     const rows = issued.map((d) => {
       const returned_cost = returned.get(d.department_id) || 0
-      return { ...d, returned_cost, net_cost: d.issued_cost - returned_cost }
+      return { department_id: d.department_id, name: d.name, issues: d.issues, issued_cost: d.issued_cost, returned_cost, net_cost: d.issued_cost - returned_cost }
     })
-    res.json(rows.sort((a, b) => a.name.localeCompare(b.name)))
+    res.json(rows.sort((a, b) => String(a.name).localeCompare(String(b.name))))
   })
 
-  r.get('/expiry', (req, res) => {
-    const days = Number(req.query.days) || Number(getSettings(db).near_expiry_days) || 90
-    res.json(
-      db.prepare(
-        `SELECT b.*, p.name AS product_name, p.strength, (b.qty_on_hand * b.cost_price) AS cost_value,
-           CAST(julianday(b.expiry_date) - julianday(:today) AS INTEGER) AS days_to_expiry
-         FROM batches b JOIN products p ON p.id = b.product_id
-         WHERE b.qty_on_hand > 0 AND b.expiry_date <= date(:today, :window)
-         ORDER BY b.expiry_date`,
-      ).all({ today: today(), window: `+${days} days` }),
-    )
+  r.get('/expiry', async (req, res) => {
+    const t = today()
+    const days = Number(req.query.days) || Number((await getSettings(db)).near_expiry_days) || 90
+    const rows = await db.all('batches', { qty_on_hand: { $gt: 0 }, expiry_date: { $lte: addDays(t, days) } }, { sort: { expiry_date: 1 } })
+    await db.join(rows, [{ key: 'product_id', from: 'products', fields: { product_name: 'name', strength: 'strength' } }])
+    res.json(rows.map((b) => ({ ...b, cost_value: b.qty_on_hand * b.cost_price, days_to_expiry: daysBetween(t, b.expiry_date) })))
   })
 
   // Supplier dues with ageing by days past due. Payments settle the oldest bills first.
   // ?owing=1 leaves out suppliers with a zero balance.
-  r.get('/supplier-dues', (req, res) => {
-    const rows = [...supplierDues(db).values()]
+  r.get('/supplier-dues', async (req, res) => {
+    const rows = [...(await supplierDues(db)).values()]
       .filter((d) => req.query.owing !== '1' || d.balance !== 0)
       .sort((a, b) => b.overdue - a.overdue || b.balance - a.balance || a.name.localeCompare(b.name))
     res.json(rows)

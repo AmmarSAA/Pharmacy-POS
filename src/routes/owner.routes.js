@@ -1,6 +1,6 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import bcrypt from 'bcryptjs'
-import { getSettings, transaction, PROTECTED_SETTINGS } from '../db.js'
+import { getSettings, setSetting, PROTECTED_SETTINGS } from '../db.js'
 import { PRIVATE_SETTINGS } from '../auth.js'
 import { HttpError, badRequest, reqInt } from '../lib/http.js'
 import { audit } from '../lib/audit.js'
@@ -22,8 +22,8 @@ export const requireOwner = (req, res, next) => {
 }
 
 // Re-check the owner's password before sensitive changes, so an unattended signed-in screen isn't enough.
-function confirmPassword(db, userId, password) {
-  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(userId)
+export async function confirmPassword(db, userId, password) {
+  const row = await db.get('users', userId)
   if (!password || !bcrypt.compareSync(String(password), row.password_hash)) {
     throw new HttpError(403, 'Password is incorrect')
   }
@@ -34,9 +34,9 @@ export default function ownerRoutes(db) {
   r.use(requireOwner)
 
   // Body: { current_password, ...protected settings }
-  r.put('/settings', (req, res) => {
-    confirmPassword(db, req.user.id, req.body.current_password)
-    const before = getSettings(db)
+  r.put('/settings', async (req, res) => {
+    await confirmPassword(db, req.user.id, req.body.current_password)
+    const before = await getSettings(db)
     const changes = {}
     for (const [key, value] of Object.entries(req.body || {})) {
       if (key === 'current_password') continue
@@ -47,36 +47,35 @@ export default function ownerRoutes(db) {
       if (Array.isArray(rule) && !rule.includes(v)) throw badRequest(`${key} must be one of ${rule.join(', ')}`)
       if (before[key] !== v) changes[key] = { from: before[key], to: v }
     }
-    transaction(db, () => {
-      const update = db.prepare('UPDATE settings SET value = ? WHERE key = ?')
-      for (const [key, { to }] of Object.entries(changes)) update.run(to, key)
-      if (Object.keys(changes).length) audit(db, req.user.id, 'settings.update', changes)
+    await db.tx(async () => {
+      for (const [key, { to }] of Object.entries(changes)) await setSetting(db, key, to)
+      if (Object.keys(changes).length) await audit(db, req.user.id, 'settings.update', changes)
     })
-    const s = getSettings(db)
+    const s = await getSettings(db)
     for (const k of PRIVATE_SETTINGS) delete s[k]
     res.json(s)
   })
 
-  r.get('/audit', (req, res) => {
+  r.get('/audit', async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 200, 1000)
-    const rows = db.prepare(
-      `SELECT a.id, a.created_at, a.action, a.detail, u.full_name AS user_name
-       FROM audit_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT ${limit}`,
-    ).all()
-    res.json(rows.map((row) => ({ ...row, detail: row.detail ? JSON.parse(row.detail) : null })))
+    const rows = await db.all('audit_log', {}, { sort: { id: -1 }, limit })
+    await db.join(rows, [{ key: 'user_id', from: 'users', fields: { user_name: 'full_name' } }])
+    res.json(rows.map((row) => ({
+      id: row.id, created_at: row.created_at, action: row.action, detail: row.detail ? JSON.parse(row.detail) : null, user_name: row.user_name,
+    })))
   })
 
   // Body: { user_id, current_password }. The new owner must be an active admin.
-  r.post('/transfer', (req, res) => {
-    confirmPassword(db, req.user.id, req.body.current_password)
+  r.post('/transfer', async (req, res) => {
+    await confirmPassword(db, req.user.id, req.body.current_password)
     const userId = reqInt(req.body, 'user_id', { min: 1, label: 'User' })
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
+    const target = await db.get('users', userId)
     if (!target || !target.active || target.role !== 'admin') throw badRequest('Ownership can only go to an active admin')
     if (target.id === req.user.id) throw badRequest('You are already the owner')
-    transaction(db, () => {
-      db.prepare('UPDATE users SET is_owner = 0 WHERE id = ?').run(req.user.id)
-      db.prepare('UPDATE users SET is_owner = 1 WHERE id = ?').run(target.id)
-      audit(db, req.user.id, 'owner.transfer', { to: target.username })
+    await db.tx(async () => {
+      await db.col('users').updateOne({ _id: req.user.id }, { $set: { is_owner: 0 } })
+      await db.col('users').updateOne({ _id: target.id }, { $set: { is_owner: 1 } })
+      await audit(db, req.user.id, 'owner.transfer', { to: target.username })
     })
     res.json({ owner: { id: target.id, username: target.username, full_name: target.full_name } })
   })

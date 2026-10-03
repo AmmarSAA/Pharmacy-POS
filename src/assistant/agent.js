@@ -1,7 +1,6 @@
 // The in-app assistant: runs model turns, executes lookups, and pauses for approval before any change.
-// All database work is synchronous; only the model call (fetch) is awaited.
 import { HttpError } from '../lib/http.js'
-import { getSettings, sqlNow, today } from '../db.js'
+import { getSettings, nowStamp, today } from '../db.js'
 import { audit } from '../lib/audit.js'
 import { apiAs } from './internal.js'
 import { activeProvider, PROVIDERS, resolveKey } from './providers.js'
@@ -46,8 +45,8 @@ const parse = (v, def) => {
   try { return JSON.parse(v) } catch { return def }
 }
 
-export function loadConversation(db, id, userId) {
-  const row = db.prepare('SELECT * FROM assistant_conversations WHERE id = ? AND user_id = ?').get(Number(id), userId)
+export async function loadConversation(db, id, userId) {
+  const row = await db.col('assistant_conversations').findOne({ _id: Number(id), user_id: userId })
   if (!row) return null
   return {
     ...row,
@@ -57,20 +56,19 @@ export function loadConversation(db, id, userId) {
   }
 }
 
-function save(db, c) {
-  db.prepare(
-    `UPDATE assistant_conversations SET title = ?, lang = ?, status = ?, messages = ?, transcript = ?, pending = ?,
-       steps_this_turn = ?, retry_after_ms = ?, updated_at = ${sqlNow()} WHERE id = ?`,
-  ).run(c.title, c.lang, c.status, JSON.stringify(c.messages), JSON.stringify(c.transcript),
-    c.pending ? JSON.stringify(c.pending) : null, c.steps_this_turn, c.retry_after_ms, c.id)
-  c.updated_at = db.prepare('SELECT updated_at FROM assistant_conversations WHERE id = ?').get(c.id).updated_at
+async function save(db, c) {
+  c.updated_at = nowStamp()
+  await db.col('assistant_conversations').updateOne({ _id: c.id }, { $set: {
+    title: c.title, lang: c.lang, status: c.status, messages: JSON.stringify(c.messages), transcript: JSON.stringify(c.transcript),
+    pending: c.pending ? JSON.stringify(c.pending) : null, steps_this_turn: c.steps_this_turn, retry_after_ms: c.retry_after_ms,
+    updated_at: c.updated_at,
+  } })
 }
 
-export function listConversations(db, userId) {
-  return db.prepare(
-    `SELECT id, title, status, updated_at FROM assistant_conversations WHERE user_id = ?
-     ORDER BY updated_at DESC, id DESC LIMIT 30`,
-  ).all(userId)
+export async function listConversations(db, userId) {
+  return db.all('assistant_conversations', { user_id: userId }, {
+    projection: { id: 1, title: 1, status: 1, updated_at: 1 }, sort: { updated_at: -1, id: -1 }, limit: 30,
+  })
 }
 
 // What the browser sees: transcript and status, never the raw provider history.
@@ -97,9 +95,9 @@ function acquire(c) {
 const release = (c) => locks.delete(c.id)
 export const isBusy = (id) => (locks.get(Number(id)) || 0) > Date.now()
 
-function providerFor(db, c) {
+async function providerFor(db, c) {
   const p = PROVIDERS[c.provider]
-  if (!p || (p.name === 'groq' && !resolveKey(db).key)) {
+  if (!p || (p.name === 'groq' && !(await resolveKey(db)).key)) {
     throw new HttpError(503, 'The assistant is not configured. The owner can add a key in Owner → Assistant.')
   }
   return p
@@ -129,8 +127,8 @@ const toolCtx = (app, db, user) => ({ call: apiAs(app, db, user), user, db })
 
 // Run model steps until the turn ends, needs approval, or the time budget is used.
 async function advance(db, app, c, user) {
-  const provider = providerFor(db, c)
-  const settings = getSettings(db)
+  const provider = await providerFor(db, c)
+  const settings = await getSettings(db)
   const tools = apiTools(user)
   const ctx = toolCtx(app, db, user)
   const started = Date.now()
@@ -149,7 +147,7 @@ async function advance(db, app, c, user) {
         system: systemPrompt(user, settings, c.lang),
         tools,
         history: trimHistory(c.messages),
-        key: resolveKey(db).key,
+        key: (await resolveKey(db)).key,
         timeoutMs: Math.max(4000, Math.min(12000, REQUEST_CAP_MS - (Date.now() - started))),
       })
     } catch (err) {
@@ -207,21 +205,21 @@ async function advance(db, app, c, user) {
       break
     }
     c.messages.push(...provider.toolResults(results))
-    save(db, c)
+    await save(db, c)
   }
-  save(db, c)
+  await save(db, c)
   return c
 }
 
 // On an API failure, end the turn cleanly (from the last saved state) so the user can retry.
-function failTurn(db, c, user, err) {
+async function failTurn(db, c, user, err) {
   if (process.env.NODE_ENV !== 'test' && !process.env.AGENT_PROVIDER) console.error('[assistant]', c.provider, err.status || '', err.message)
-  const fresh = loadConversation(db, c.id, user.id)
+  const fresh = await loadConversation(db, c.id, user.id)
   if (!fresh || fresh.status !== 'running') return
   fresh.status = 'idle'
   fresh.retry_after_ms = 0
   fresh.transcript.push({ type: 'error', text: err.status >= 500 || err.status === 429 ? err.message : `Something went wrong: ${err.message}` })
-  save(db, fresh)
+  await save(db, fresh)
 }
 
 async function withLock(db, c, user, fn) {
@@ -229,7 +227,7 @@ async function withLock(db, c, user, fn) {
   try {
     return await fn()
   } catch (err) {
-    failTurn(db, c, user, err)
+    await failTurn(db, c, user, err).catch(() => {})
     throw err
   } finally {
     release(c)
@@ -237,24 +235,26 @@ async function withLock(db, c, user, fn) {
 }
 
 export async function startConversation(db, app, user, text, lang) {
-  const provider = activeProvider(db)
+  const provider = await activeProvider(db)
   if (!provider) throw new HttpError(503, 'The assistant is not set up yet. The owner can add a key in Owner → Assistant.')
-  const { lastInsertRowid } = db.prepare(
-    'INSERT INTO assistant_conversations (user_id, title, provider, lang) VALUES (?, ?, ?, ?)',
-  ).run(user.id, text.replace(/\s+/g, ' ').slice(0, 70), provider.name, lang)
-  return sendMessage(db, app, loadConversation(db, Number(lastInsertRowid), user.id), user, text, lang)
+  const stamp = nowStamp()
+  const id = await db.insert('assistant_conversations', {
+    user_id: user.id, title: text.replace(/\s+/g, ' ').slice(0, 70), provider: provider.name, lang, status: 'idle',
+    messages: '[]', transcript: '[]', pending: null, steps_this_turn: 0, retry_after_ms: 0, created_at: stamp, updated_at: stamp,
+  })
+  return sendMessage(db, app, await loadConversation(db, id, user.id), user, text, lang)
 }
 
 export async function sendMessage(db, app, c, user, text, lang) {
   if (c.status === 'awaiting_approval') throw new HttpError(409, 'Approve or decline the pending action first')
   return withLock(db, c, user, async () => {
-    c.messages.push(...providerFor(db, c).userMessage(text))
+    c.messages.push(...(await providerFor(db, c)).userMessage(text))
     c.transcript.push({ type: 'user', text })
     c.lang = lang
     c.status = 'running'
     c.steps_this_turn = 0
     c.retry_after_ms = 0
-    save(db, c)
+    await save(db, c)
     return advance(db, app, c, user)
   })
 }
@@ -267,7 +267,7 @@ export async function continueConversation(db, app, c, user) {
 export async function decide(db, app, c, user, decisions) {
   if (c.status !== 'awaiting_approval' || !c.pending) throw new HttpError(409, 'Nothing is waiting for approval')
   return withLock(db, c, user, async () => {
-    const provider = providerFor(db, c)
+    const provider = await providerFor(db, c)
     const { calls, order = [] } = c.pending
     const results = [...c.pending.results]
     const entryOf = (id) => c.transcript.find((e) => e.type === 'approval' && e.id === id)
@@ -279,7 +279,7 @@ export async function decide(db, app, c, user, decisions) {
       const e = entryOf(call.id)
       if (e) e.state = decisions?.[call.id] === true ? 'running' : 'declined'
     }
-    save(db, c)
+    await save(db, c)
 
     const ctx = toolCtx(app, db, user)
     for (const call of calls) {
@@ -292,7 +292,7 @@ export async function decide(db, app, c, user, decisions) {
         const out = await runWriteTool(toolByName(call.name), call.input, ctx)
         results.push({ id: call.id, content: asContent(out) })
         if (entry) Object.assign(entry, { state: 'done', result: out })
-        audit(db, user.id, 'assistant.action', { tool: call.name, details: Object.fromEntries(call.details) })
+        await audit(db, user.id, 'assistant.action', { tool: call.name, details: Object.fromEntries(call.details) })
       } catch (err) {
         results.push({ id: call.id, content: `Error: ${err.message}`, isError: true })
         if (entry) Object.assign(entry, { state: 'failed', error: err.message })
@@ -301,12 +301,12 @@ export async function decide(db, app, c, user, decisions) {
     results.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id))
     c.messages.push(...provider.toolResults(results))
     // Save the outcome before calling the model again, so an approved action can never run twice.
-    save(db, c)
+    await save(db, c)
     return advance(db, app, c, user)
   })
 }
 
-export function deleteConversation(db, c) {
+export async function deleteConversation(db, c) {
   if (isBusy(c.id)) throw new HttpError(409, 'The assistant is still working on this conversation')
-  db.prepare('DELETE FROM assistant_conversations WHERE id = ?').run(c.id)
+  await db.col('assistant_conversations').deleteOne({ _id: c.id })
 }

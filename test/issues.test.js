@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 
 // Department issues: requests, FEFO issuing at cost, returns, reports.
@@ -9,12 +9,15 @@ const tokens = {}
 const ids = {}
 
 before(async () => {
-  db = openDb(':memory:')
+  db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server?.close())
+after(async () => {
+  server?.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body, as = 'admin') {
   const res = await fetch(base + path, {
@@ -26,14 +29,9 @@ async function call(method, path, body, as = 'admin') {
 }
 
 const inDays = (n) => new Date(Date.now() + n * 864e5).toISOString().slice(0, 10)
-const stockOf = (id) => db.prepare('SELECT qty_on_hand FROM batches WHERE id = ?').get(id).qty_on_hand
+const stockOf = async (id) => (await db.get('batches', id)).qty_on_hand
 const addBatch = (productId, no, expiry, qty, cost) =>
-  Number(
-    db.prepare(
-      `INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price, qty_on_hand, pack_size)
-       VALUES (?, ?, ?, ?, ?, ?, 10)`,
-    ).run(productId, no, expiry, cost, cost * 2, qty).lastInsertRowid,
-  )
+  put(db, 'batches', { product_id: productId, batch_no: no, expiry_date: expiry, cost_price: cost, sale_price: cost * 2, qty_on_hand: qty, pack_size: 10 })
 
 test('setup', async () => {
   await call('POST', '/auth/setup', { username: 'owner', full_name: 'Owner', password: 'secret123' })
@@ -46,11 +44,11 @@ test('setup', async () => {
   ids.para = await mk({ name: 'Paracetamol', pack_size: 10, pack_price: 1000, allow_loose: 1 })
   ids.box = await mk({ name: 'Boxed', pack_size: 10, pack_price: 1000, allow_loose: 0 })
   ids.morph = await mk({ name: 'Morphine', pack_size: 10, pack_price: 5000, allow_loose: 1, schedule: 'controlled' })
-  ids.expired = addBatch(ids.para, 'OLD', inDays(-5), 50, 10)
-  ids.b1 = addBatch(ids.para, 'B1', inDays(30), 20, 50)
-  ids.b2 = addBatch(ids.para, 'B2', inDays(200), 100, 60)
-  ids.mb = addBatch(ids.morph, 'M1', inDays(200), 30, 400)
-  ids.boxb = addBatch(ids.box, 'X1', inDays(200), 5, 70)
+  ids.expired = await addBatch(ids.para, 'OLD', inDays(-5), 50, 10)
+  ids.b1 = await addBatch(ids.para, 'B1', inDays(30), 20, 50)
+  ids.b2 = await addBatch(ids.para, 'B2', inDays(200), 100, 60)
+  ids.mb = await addBatch(ids.morph, 'M1', inDays(200), 30, 400)
+  ids.boxb = await addBatch(ids.box, 'X1', inDays(200), 5, 70)
 })
 
 test('departments: CRUD, duplicates, roles', async () => {
@@ -94,9 +92,9 @@ test('request create, list and get; issue FEFO with cost and status', async () =
   assert.equal(iss.body.items.length, 2)
   assert.deepEqual(iss.body.items.map((i) => [i.batch_no, i.qty, i.unit_cost, i.line_cost]), [['B1', 20, 50, 1000], ['B2', 5, 60, 300]])
   assert.equal(iss.body.total_cost, 1300)
-  assert.equal(stockOf(ids.b1), 0)
-  assert.equal(stockOf(ids.b2), 95)
-  assert.equal(stockOf(ids.expired), 50)
+  assert.equal(await stockOf(ids.b1), 0)
+  assert.equal(await stockOf(ids.b2), 95)
+  assert.equal(await stockOf(ids.expired), 50)
   ids.issue1 = iss.body.id
   let req = (await call('GET', `/issue-requests/${ids.rq}`)).body
   assert.equal(req.status, 'partial')
@@ -109,7 +107,7 @@ test('request create, list and get; issue FEFO with cost and status', async () =
   assert.equal(req.items[0].qty_issued, 45) // over-issue allowed
   assert.equal((await call('POST', '/issues', { department_id: ids.ot, request_id: ids.rq, items: [{ product_id: ids.para, qty: 1 }] })).status, 409)
 
-  const mv = db.prepare("SELECT * FROM stock_movements WHERE reason = 'issue' AND ref_id = ?").all(ids.issue1)
+  const mv = await db.all('stock_movements', { reason: 'issue', ref_id: ids.issue1 }, { sort: { id: 1 } })
   assert.equal(mv.length, 2)
   assert.equal(mv[0].change, -20)
   assert.equal(mv[0].note, 'OT')
@@ -129,12 +127,12 @@ test('request item must belong to request; cancelled request', async () => {
 })
 
 test('short stock 409 writes nothing', async () => {
-  const before = db.prepare('SELECT COUNT(*) AS n FROM issues').get().n
+  const before = await db.col('issues').countDocuments()
   const short = await call('POST', '/issues', { department_id: ids.ot, items: [{ product_id: ids.para, qty: 1 }, { product_id: ids.box, packs: 1 }] })
   assert.equal(short.status, 409)
   assert.match(short.body.message, /Not enough stock for Boxed: 5 available/)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM issues').get().n, before)
-  assert.equal(stockOf(ids.b2), 75)
+  assert.equal(await db.col('issues').countDocuments(), before)
+  assert.equal(await stockOf(ids.b2), 75)
 })
 
 test('controlled drugs need received_by; register shows department', async () => {
@@ -158,32 +156,32 @@ test('issue return restocks, caps, expired not restocked', async () => {
   const [i1, i2] = issue.items
   const over = await call('POST', `/issues/${ids.issue1}/returns`, { reason: 'x', items: [{ issue_item_id: i2.id, qty: 6 }] })
   assert.equal(over.status, 400)
-  const before = stockOf(ids.b2)
+  const before = await stockOf(ids.b2)
   const ok = await call('POST', `/issues/${ids.issue1}/returns`, { reason: 'unused', items: [{ issue_item_id: i2.id, qty: 2 }, { issue_item_id: i1.id, qty: 3 }] })
   assert.equal(ok.status, 201)
-  assert.equal(stockOf(ids.b2), before + 2)
-  assert.equal(stockOf(ids.b1), 3)
+  assert.equal(await stockOf(ids.b2), before + 2)
+  assert.equal(await stockOf(ids.b1), 3)
   assert.equal(ok.body.returns[0].total_cost, 2 * 60 + 3 * 50)
   assert.equal(ok.body.returned_cost, 270)
   assert.equal(ok.body.items[1].returned_qty, 2)
   const again = await call('POST', `/issues/${ids.issue1}/returns`, { reason: 'x', items: [{ issue_item_id: i2.id, qty: 4 }] })
   assert.equal(again.status, 400)
-  const mv = db.prepare("SELECT * FROM stock_movements WHERE reason = 'issue_return' AND ref_id = ?").all(ok.body.returns[0].id)
+  const mv = await db.all('stock_movements', { reason: 'issue_return', ref_id: ok.body.returns[0].id }, { sort: { id: 1 } })
   assert.equal(mv.length, 2)
   assert.equal(mv[0].note, 'OT')
   // no-restock
   const nr = await call('POST', `/issues/${ids.issue1}/returns`, { reason: 'damaged', items: [{ issue_item_id: i2.id, qty: 1, restock: false }] })
   assert.equal(nr.status, 201)
-  assert.equal(stockOf(ids.b2), before + 2)
+  assert.equal(await stockOf(ids.b2), before + 2)
   // expired batch: not restocked
-  const exp = db.prepare(
-    "INSERT INTO issue_items (issue_id, product_id, batch_id, qty, unit_cost, line_cost, pack_size) VALUES (?, ?, ?, 5, 10, 50, 10)",
-  ).run(ids.issue1, ids.para, ids.expired)
-  const ex = await call('POST', `/issues/${ids.issue1}/returns`, { reason: 'x', items: [{ issue_item_id: Number(exp.lastInsertRowid), qty: 5 }] })
+  const expId = await put(db, 'issue_items', {
+    issue_id: ids.issue1, product_id: ids.para, batch_id: ids.expired, qty: 5, unit_cost: 10, line_cost: 50, pack_size: 10, returned_qty: 0,
+  })
+  const ex = await call('POST', `/issues/${ids.issue1}/returns`, { reason: 'x', items: [{ issue_item_id: expId, qty: 5 }] })
   assert.equal(ex.status, 201)
-  assert.equal(stockOf(ids.expired), 50)
-  db.prepare('DELETE FROM issue_return_items WHERE issue_item_id = ?').run(Number(exp.lastInsertRowid))
-  db.prepare('DELETE FROM issue_items WHERE id = ?').run(Number(exp.lastInsertRowid))
+  assert.equal(await stockOf(ids.expired), 50)
+  await db.col('issue_return_items').deleteMany({ issue_item_id: expId })
+  await db.col('issue_items').deleteOne({ _id: expId })
 })
 
 test('issue list and department-usage', async () => {

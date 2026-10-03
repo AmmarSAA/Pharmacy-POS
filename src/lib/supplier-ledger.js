@@ -20,19 +20,18 @@ export function daysBetween(from, to) {
 // after the supplier's credit days, or at once when the owner sets opening_balance_due = 'immediate'.
 const openingDate = (s) => s.opening_date || String(s.created_at).slice(0, 10)
 
-function loadRows(db, supplierId) {
-  const where = supplierId ? 'WHERE supplier_id = ?' : ''
-  const args = supplierId ? [supplierId] : []
-  const purchases = db.prepare(
-    `SELECT id, supplier_id, invoice_no, payment_type, total, notes,
-       COALESCE(invoice_date, date(created_at)) AS date,
-       COALESCE(due_date, invoice_date, date(created_at)) AS due_date
-     FROM purchases ${where} ORDER BY date, id`,
-  ).all(...args)
-  const payments = db.prepare(
-    `SELECT id, supplier_id, amount, method, reference, paid_on, purchase_id, note
-     FROM supplier_payments ${where} ORDER BY paid_on, id`,
-  ).all(...args)
+async function loadRows(db, supplierId) {
+  const filter = supplierId ? { supplier_id: supplierId } : {}
+  const purchases = (await db.col('purchases').find(filter, {
+    projection: { id: 1, supplier_id: 1, invoice_no: 1, payment_type: 1, total: 1, notes: 1, invoice_date: 1, due_date: 1, created_at: 1 },
+  }).toArray()).map((p) => {
+    const date = p.invoice_date || String(p.created_at).slice(0, 10)
+    return { ...p, date, due_date: p.due_date || date }
+  }).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id))
+  const payments = await db.col('supplier_payments').find(filter, {
+    projection: { id: 1, supplier_id: 1, amount: 1, method: 1, reference: 1, paid_on: 1, purchase_id: 1, note: 1 },
+    sort: { paid_on: 1, id: 1 },
+  }).toArray()
   return { purchases, payments }
 }
 
@@ -100,15 +99,13 @@ function dues(supplier, purchases, payments, asOf, openingDue = 'terms') {
 }
 
 // Dues for every supplier (or one), keyed by supplier id.
-export function supplierDues(db, { supplierId = null, asOf = today() } = {}) {
-  const suppliers = supplierId
-    ? db.prepare('SELECT * FROM suppliers WHERE id = ?').all(supplierId)
-    : db.prepare('SELECT * FROM suppliers ORDER BY name').all()
-  const { purchases, payments } = loadRows(db, supplierId)
+export async function supplierDues(db, { supplierId = null, asOf = today() } = {}) {
+  const suppliers = await db.col('suppliers').find(supplierId ? { _id: Number(supplierId) } : {}, { sort: { name: 1 } }).toArray()
+  const { purchases, payments } = await loadRows(db, supplierId ? Number(supplierId) : null)
   const byP = group(purchases)
   const byPay = group(payments)
   const result = new Map()
-  const openingDue = getSettings(db).opening_balance_due
+  const openingDue = (await getSettings(db)).opening_balance_due
   for (const s of suppliers) result.set(s.id, dues(s, byP.get(s.id) || [], byPay.get(s.id) || [], asOf, openingDue))
   return result
 }
@@ -118,8 +115,8 @@ const METHOD_LABEL = { cash: 'Cash', bank: 'Bank transfer', cheque: 'Cheque', ti
 
 // Statement with running balance (debit = billed, credit = paid, balance = owed).
 // Entries before `from` are carried in as one "balance brought forward" line.
-export function supplierLedger(db, supplier, { from = null, to = null } = {}) {
-  const { purchases, payments } = loadRows(db, supplier.id)
+export async function supplierLedger(db, supplier, { from = null, to = null } = {}) {
+  const { purchases, payments } = await loadRows(db, supplier.id)
   const all = []
   if (supplier.opening_balance > 0) {
     all.push({ date: openingDate(supplier), type: 'opening', ref: null, description: 'Opening balance',
@@ -157,22 +154,21 @@ export function supplierLedger(db, supplier, { from = null, to = null } = {}) {
 
 // For method 'till': the paying user's open till, required even when the pharmacy does not
 // require tills for sales (cash cannot leave a drawer that is not open).
-export function tillForSupplierPayment(db, userId) {
-  const till = tillForCash(db, userId, getSettings(db), 'pay a supplier from the till')
+export async function tillForSupplierPayment(db, userId) {
+  const till = await tillForCash(db, userId, await getSettings(db), 'pay a supplier from the till')
   if (!till) throw new HttpError(409, 'Open your till before you pay a supplier from the till')
   return till
 }
 
 // Inserts a supplier payment (call inside a transaction). A 'till' payment also takes the cash
 // out of the till given (from tillForSupplierPayment).
-export function recordSupplierPayment(db, { supplier, amount, method, reference = null, paidOn, purchaseId = null, note = null, userId, till = null }) {
-  const { lastInsertRowid } = db.prepare(
-    `INSERT INTO supplier_payments (supplier_id, amount, method, reference, paid_on, purchase_id, till_session_id, note, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(supplier.id, amount, method, reference, paidOn, purchaseId, method === 'till' ? till.id : null, note, userId)
-  const id = Number(lastInsertRowid)
+export async function recordSupplierPayment(db, { supplier, amount, method, reference = null, paidOn, purchaseId = null, note = null, userId, till = null }) {
+  const id = await db.insert('supplier_payments', {
+    supplier_id: supplier.id, amount, method, reference, paid_on: paidOn, purchase_id: purchaseId,
+    till_session_id: method === 'till' ? till.id : null, note, user_id: userId,
+  })
   if (method === 'till') {
-    recordCashMovement(db, { tillSessionId: till.id, direction: 'out', amount, reason: `Payment to ${supplier.name}`,
+    await recordCashMovement(db, { tillSessionId: till.id, direction: 'out', amount, reason: `Payment to ${supplier.name}`,
       supplierPaymentId: id, userId })
   }
   return id

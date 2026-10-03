@@ -1,11 +1,13 @@
-// Cloudflare Workers entry point. The whole app runs inside one Durable Object, whose
-// built-in SQLite storage is the pharmacy database (one object = one pharmacy, one writer).
+// Cloudflare Workers entry point. The whole app runs inside one Durable Object, which holds the
+// MongoDB Atlas connection (MONGODB_URI secret) for all requests. The object's own SQLite storage
+// held the database before the move to MongoDB; it is left untouched.
 import { DurableObject } from 'cloudflare:workers'
 import { httpServerHandler } from 'cloudflare:node'
 import { createServer } from 'node:http'
 import { createApp } from '../src/app.js'
+import { MongoClient } from 'mongodb'
 import { initDb, configureClock } from '../src/db.js'
-import { SqlStorageDb } from './sql-storage-db.js'
+import { Store } from '../src/store.js'
 import staticFiles from './static-files.gen.js'
 
 const PORT = 8080
@@ -31,11 +33,33 @@ export class PharmacyStore extends DurableObject {
     super(ctx, env)
     configureClock(env.UTC_OFFSET_MINUTES ?? 300)
     this.instanceId = ctx.id.toString()
-    const db = initDb(new SqlStorageDb(ctx.storage))
-    apps.set(this.instanceId, createApp(db, { staticFiles }))
   }
 
-  fetch(request) {
+  // Connects on the first request (sockets can't be opened at startup) and reuses the client.
+  ready() {
+    if (!this.starting) {
+      this.starting = (async () => {
+        if (!this.env.MONGODB_URI) throw new Error('MONGODB_URI is not set')
+        const client = await MongoClient.connect(this.env.MONGODB_URI, {
+          appName: 'pharmacy-pos', maxPoolSize: 10, serverSelectionTimeoutMS: 10000,
+        })
+        const db = await initDb(new Store(client, client.db(this.env.MONGODB_DB || 'pharmacy')))
+        apps.set(this.instanceId, createApp(db, { staticFiles }))
+      })().catch((err) => {
+        this.starting = null
+        throw err
+      })
+    }
+    return this.starting
+  }
+
+  async fetch(request) {
+    try {
+      await this.ready()
+    } catch (err) {
+      console.error('database connection failed:', err.message)
+      return Response.json({ message: 'The database is not reachable. Try again in a minute.' }, { status: 503 })
+    }
     const headers = new Headers(request.headers)
     headers.set(INSTANCE_HEADER, this.instanceId)
     return handler.fetch(new Request(request, { headers }), this.env, this.ctx)
