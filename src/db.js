@@ -91,13 +91,17 @@ export const PROTECTED_SETTINGS = [
   'assistant_enabled',
 ]
 
+// A fresh copy each call (callers may change it); read from a short cache cleared on every settings write.
 export async function getSettings(store) {
-  const rows = await store.col('settings').raw.find({}, withSession()).toArray()
-  return Object.fromEntries(rows.map((r) => [r._id, r.value]))
+  const all = await store.cached('settings', 'all', 60000, async () => {
+    const rows = await store.col('settings').raw.find({}, withSession()).toArray()
+    return Object.fromEntries(rows.map((r) => [r._id, r.value]))
+  })
+  return { ...all }
 }
 
 export async function getSetting(store, key) {
-  return (await store.col('settings').raw.findOne({ _id: key }, withSession()))?.value ?? null
+  return (await getSettings(store))[key] ?? null
 }
 
 export async function setSetting(store, key, value) {

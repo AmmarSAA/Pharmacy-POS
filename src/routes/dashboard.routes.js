@@ -38,13 +38,17 @@ async function salesByDay(db, from, to) {
 // Gross profit on goods for one day, same formula as /reports/summary (excludes GST).
 async function grossProfit(db, day, sales) {
   const when = dayRange(day, day)
-  const cost = (await db.col('sale_items').aggregate([
-    { $match: when }, { $group: { _id: null, v: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } },
-  ]).toArray())[0]?.v || 0
-  const ret = (await db.col('return_items').aggregate([
-    { $match: when }, { $group: { _id: null, tax: { $sum: '$tax' }, cost: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } },
-  ]).toArray())[0] || { tax: 0, cost: 0 }
-  const refunds = await db.sum('returns', when, 'refund_total')
+  const [c, r, refunds] = await Promise.all([
+    db.col('sale_items').aggregate([
+      { $match: when }, { $group: { _id: null, v: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } },
+    ]).toArray(),
+    db.col('return_items').aggregate([
+      { $match: when }, { $group: { _id: null, tax: { $sum: '$tax' }, cost: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } },
+    ]).toArray(),
+    db.sum('returns', when, 'refund_total'),
+  ])
+  const cost = c[0]?.v || 0
+  const ret = r[0] || { tax: 0, cost: 0 }
   return (sales.total - refunds) - (sales.tax - ret.tax) - (cost - ret.cost)
 }
 
@@ -71,85 +75,114 @@ export default function dashboardRoutes(db) {
     const lists = {}
     const charts = {}
 
-    // Everyone: own till and own sales today.
-    cards.my_till = await myTill(db, userId)
+    const sales = db.col('sales')
+    const batches = db.col('batches')
+    const products = db.col('products')
     const mine = { ...tr, user_id: userId }
-    cards.my_sales_today = { invoices: await db.col('sales').countDocuments(mine), total: await db.sum('sales', mine, 'total') }
-    // Cashiers see only their own sales; supervisors see the latest across the pharmacy.
-    const recent = await db.all('sales', staff ? {} : { user_id: userId }, {
-      sort: { created_at: -1, id: -1 }, limit: 10,
-      projection: { id: 1, invoice_no: 1, created_at: 1, customer_name: 1, payment_method: 1, total: 1, prescription_id: 1, user_id: 1 },
-    })
-    await db.join(recent, [{ key: 'user_id', from: 'users', fields: { cashier_name: 'full_name' } }])
-    lists.recent_sales = recent.map(({ user_id, ...s }) => s)
 
-    if (staff) {
-      const days = await salesByDay(db, addDays(t, -6), t)
-      const td = days[6]
-      const yd = days[5]
-      cards.sales_today = { invoices: td.invoices, total: td.total, prescriptions: td.prescriptions, controlled: td.controlled }
+    // Everything below is independent, so it runs in parallel (each query is a network round trip).
+    const everyone = async () => {
+      const [till, myCount, myTotal, recent] = await Promise.all([
+        myTill(db, userId),
+        sales.countDocuments(mine),
+        db.sum('sales', mine, 'total'),
+        db.all('sales', staff ? {} : { user_id: userId }, {
+          sort: { created_at: -1, id: -1 }, limit: 10,
+          projection: { id: 1, invoice_no: 1, created_at: 1, customer_name: 1, payment_method: 1, total: 1, prescription_id: 1, user_id: 1 },
+        }),
+      ])
+      cards.my_till = till
+      cards.my_sales_today = { invoices: myCount, total: myTotal }
+      // Cashiers see only their own sales; supervisors see the latest across the pharmacy.
+      await db.join(recent, [{ key: 'user_id', from: 'users', fields: { cashier_name: 'full_name' } }])
+      lists.recent_sales = recent.map(({ user_id, ...x }) => x)
+    }
 
+    const staffPart = async () => {
+      const settings = await getSettings(db)
       // Stock alerts. Stock counts only unexpired batches, as /reports/low-stock does.
-      const nearDays = Number((await getSettings(db)).near_expiry_days) || 90
+      const nearDays = Number(settings.near_expiry_days) || 90
       const nearLimit = addDays(t, nearDays)
-      const products = db.col('products')
       const unpricedFilter = { active: 1, $or: [{ pack_price: 0 }, { pack_price: null }] }
-      const unpriced = await products.countDocuments(unpricedFilter)
-      // Items in stock without a price: only products that have stock can count, so start from batches.
-      const inStock = await db.col('batches').distinct('product_id', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } })
-      const unpricedInStock = await products.countDocuments({ ...unpricedFilter, _id: { $in: inStock } })
-      const reorder = await db.all('products', { active: 1, reorder_level: { $gt: 0 } }, {
-        projection: { id: 1, name: 1, strength: 1, form: 1, pack_size: 1, reorder_level: 1 },
-      })
-      const stock = await stockFor(db, reorder.map((p) => p.id), t)
-      const low = reorder.map((p) => ({ ...p, stock: stock.get(p.id) || 0 })).filter((p) => p.stock <= p.reorder_level)
-        .sort((a, b) => a.stock - b.stock || String(a.name).localeCompare(String(b.name)))
-      const batches = db.col('batches')
+      const [days, unpriced, inStock, reorder, nearCount, expiredCount, openReq, expiring] = await Promise.all([
+        salesByDay(db, addDays(t, -6), t),
+        products.countDocuments(unpricedFilter),
+        batches.distinct('product_id', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } }),
+        db.all('products', { active: 1, reorder_level: { $gt: 0 } }, {
+          projection: { id: 1, name: 1, strength: 1, form: 1, pack_size: 1, reorder_level: 1 },
+        }),
+        batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }),
+        batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $lt: t } }),
+        db.col('issue_requests').countDocuments({ status: { $in: ['open', 'partial'] } }),
+        db.all('batches', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }, {
+          sort: { expiry_date: 1, id: 1 }, limit: 10, projection: { id: 1, product_id: 1, batch_no: 1, expiry_date: 1, qty_on_hand: 1 },
+        }),
+      ])
+      const [unpricedInStock, stock] = await Promise.all([
+        // Items in stock without a price: only products that have stock can count.
+        products.countDocuments({ ...unpricedFilter, _id: { $in: inStock } }),
+        stockFor(db, reorder.map((x) => x.id), t),
+        db.join(expiring, [{ key: 'product_id', from: 'products', fields: { product_name: 'name', strength: 'strength' } }]),
+      ])
+      const low = reorder.map((x) => ({ ...x, stock: stock.get(x.id) || 0 })).filter((x) => x.stock <= x.reorder_level)
+        .sort((x, y) => x.stock - y.stock || String(x.name).localeCompare(String(y.name)))
+      const td = days[6]
+      cards.sales_today = { invoices: td.invoices, total: td.total, prescriptions: td.prescriptions, controlled: td.controlled }
       cards.alerts = {
-        low_stock: low.length,
-        near_expiry: await batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }),
-        expired: await batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $lt: t } }),
+        low_stock: low.length, near_expiry: nearCount, expired: expiredCount,
         unpriced_items: unpriced, unpriced_in_stock: unpricedInStock, near_expiry_days: nearDays,
       }
-      cards.open_requisitions = await db.col('issue_requests').countDocuments({ status: { $in: ['open', 'partial'] } })
-      const expiring = await db.all('batches', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }, {
-        sort: { expiry_date: 1, id: 1 }, limit: 10, projection: { id: 1, product_id: 1, batch_no: 1, expiry_date: 1, qty_on_hand: 1 },
-      })
-      await db.join(expiring, [{ key: 'product_id', from: 'products', fields: { product_name: 'name', strength: 'strength' } }])
-      lists.expiring_soon = expiring.map((b) => ({ ...b, days_to_expiry: daysBetween(t, b.expiry_date) }))
+      cards.open_requisitions = openReq
+      lists.expiring_soon = expiring.map((x) => ({ ...x, days_to_expiry: daysBetween(t, x.expiry_date) }))
       lists.low_stock = low.slice(0, 10)
+      return days
+    }
 
-      if (admin) {
-        cards.sales_yesterday = { invoices: yd.invoices, total: yd.total }
-        cards.gross_profit_today = await grossProfit(db, t, td)
+    const adminPart = async (daysPromise) => {
+      const openTills = async () => {
         const open = await db.all('till_sessions', { status: 'open' }, { projection: { id: 1 } })
-        let expected = 0
-        for (const x of open) expected += (await tillTotals(db, x.id))?.expected_cash || 0
-        cards.cash_in_open_tills = { tills: open.length, expected_cash: expected }
-        const dues = [...(await supplierDues(db)).values()]
-        cards.supplier_dues = {
-          balance: dues.reduce((s, d) => s + d.balance, 0),
-          overdue: dues.reduce((s, d) => s + d.overdue, 0),
-          suppliers_overdue: dues.filter((d) => d.overdue > 0).length,
-        }
-        const sv = (await batches.aggregate([
-          { $match: { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } } },
-          { $group: { _id: null, cost: { $sum: { $multiply: ['$qty_on_hand', '$cost_price'] } }, retail: { $sum: { $multiply: ['$qty_on_hand', '$sale_price'] } } } },
-        ]).toArray())[0]
-        cards.stock_value = { cost: sv?.cost || 0, retail: sv?.retail || 0 }
-        cards.issues_today = { count: await db.col('issues').countDocuments(tr), cost: await db.sum('issues', tr, 'total_cost') }
-        charts.sales_7d = days.map((d) => ({ day: d.day, total: d.total, invoices: d.invoices }))
+        const totals = await Promise.all(open.map((x) => tillTotals(db, x.id)))
+        return { tills: open.length, expected_cash: totals.reduce((sum, x) => sum + (x?.expected_cash || 0), 0) }
+      }
+      const topToday = async () => {
         const top = (await db.col('sale_items').aggregate([
           { $match: tr },
           { $group: { _id: '$product_id', qty: { $sum: { $subtract: ['$qty', '$returned_qty'] } }, revenue: { $sum: '$line_total' } } },
           { $sort: { revenue: -1 } }, { $limit: 5 },
         ]).toArray()).map((x) => ({ id: x._id, qty: x.qty, revenue: x.revenue }))
         await db.join(top, [{ key: 'id', from: 'products', fields: { name: 'name', strength: 'strength' } }])
-        lists.top_products_today = top.map(({ id, name, strength, qty, revenue }) => ({ id, name, strength, qty, revenue }))
+        return top.map(({ id, name, strength, qty, revenue }) => ({ id, name, strength, qty, revenue }))
       }
+      const [days, tills, dues, sv, issueCount, issueCost, top] = await Promise.all([
+        daysPromise,
+        openTills(),
+        supplierDues(db),
+        batches.aggregate([
+          { $match: { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } } },
+          { $group: { _id: null, cost: { $sum: { $multiply: ['$qty_on_hand', '$cost_price'] } }, retail: { $sum: { $multiply: ['$qty_on_hand', '$sale_price'] } } } },
+        ]).toArray(),
+        db.col('issues').countDocuments(tr),
+        db.sum('issues', tr, 'total_cost'),
+        topToday(),
+      ])
+      const td = days[6]
+      const yd = days[5]
+      cards.sales_yesterday = { invoices: yd.invoices, total: yd.total }
+      cards.gross_profit_today = await grossProfit(db, t, td)
+      cards.cash_in_open_tills = tills
+      const all = [...dues.values()]
+      cards.supplier_dues = {
+        balance: all.reduce((sum, d) => sum + d.balance, 0),
+        overdue: all.reduce((sum, d) => sum + d.overdue, 0),
+        suppliers_overdue: all.filter((d) => d.overdue > 0).length,
+      }
+      cards.stock_value = { cost: sv[0]?.cost || 0, retail: sv[0]?.retail || 0 }
+      cards.issues_today = { count: issueCount, cost: issueCost }
+      charts.sales_7d = days.map((d) => ({ day: d.day, total: d.total, invoices: d.invoices }))
+      lists.top_products_today = top
     }
 
-    if (admin && isOwner) {
+    const ownerPart = async () => {
       const audit = await db.all('audit_log', {}, { sort: { id: -1 }, limit: 5 })
       await db.join(audit, [{ key: 'user_id', from: 'users', fields: { user_name: 'full_name' } }])
       lists.recent_audit = audit.map((row) => {
@@ -158,6 +191,15 @@ export default function dashboardRoutes(db) {
         return { id: row.id, created_at: row.created_at, action: row.action, detail, user_name: row.user_name }
       })
     }
+
+    const jobs = [everyone()]
+    if (staff) {
+      const days = staffPart()
+      jobs.push(days)
+      if (admin) jobs.push(adminPart(days))
+    }
+    if (admin && isOwner) jobs.push(ownerPart())
+    await Promise.all(jobs)
 
     res.json({ role, is_owner: isOwner, date: t, cards, lists, charts })
   })

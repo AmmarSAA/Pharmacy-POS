@@ -22,16 +22,16 @@ const openingDate = (s) => s.opening_date || String(s.created_at).slice(0, 10)
 
 async function loadRows(db, supplierId) {
   const filter = supplierId ? { supplier_id: supplierId } : {}
-  const purchases = (await db.col('purchases').find(filter, {
+  const [purchaseRows, payments] = await Promise.all([db.col('purchases').find(filter, {
     projection: { id: 1, supplier_id: 1, invoice_no: 1, payment_type: 1, total: 1, notes: 1, invoice_date: 1, due_date: 1, created_at: 1 },
-  }).toArray()).map((p) => {
+  }).toArray(), db.col('supplier_payments').find(filter, {
+    projection: { id: 1, supplier_id: 1, amount: 1, method: 1, reference: 1, paid_on: 1, purchase_id: 1, note: 1 },
+    sort: { paid_on: 1, id: 1 },
+  }).toArray()])
+  const purchases = purchaseRows.map((p) => {
     const date = p.invoice_date || String(p.created_at).slice(0, 10)
     return { ...p, date, due_date: p.due_date || date }
   }).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id))
-  const payments = await db.col('supplier_payments').find(filter, {
-    projection: { id: 1, supplier_id: 1, amount: 1, method: 1, reference: 1, paid_on: 1, purchase_id: 1, note: 1 },
-    sort: { paid_on: 1, id: 1 },
-  }).toArray()
   return { purchases, payments }
 }
 
@@ -100,8 +100,10 @@ function dues(supplier, purchases, payments, asOf, openingDue = 'terms') {
 
 // Dues for every supplier (or one), keyed by supplier id.
 export async function supplierDues(db, { supplierId = null, asOf = today() } = {}) {
-  const suppliers = await db.col('suppliers').find(supplierId ? { _id: Number(supplierId) } : {}, { sort: { name: 1 } }).toArray()
-  const { purchases, payments } = await loadRows(db, supplierId ? Number(supplierId) : null)
+  const [suppliers, { purchases, payments }] = await Promise.all([
+    db.col('suppliers').find(supplierId ? { _id: Number(supplierId) } : {}, { sort: { name: 1 } }).toArray(),
+    loadRows(db, supplierId ? Number(supplierId) : null),
+  ])
   const byP = group(purchases)
   const byPay = group(payments)
   const result = new Map()

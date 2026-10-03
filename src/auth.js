@@ -36,9 +36,11 @@ export function authenticate(db) {
     // Re-read the user so deactivation and role changes take effect immediately.
     let user
     try {
-      user = await db.col('users').findOne(
+      // Cached briefly; any change to a user (role, deactivation, password) clears it at once.
+      const found = await db.cached('users', `auth:${Number(payload.sub)}`, 30000, () => db.col('users').findOne(
         { _id: Number(payload.sub) }, { projection: { id: 1, username: 1, full_name: 1, role: 1, active: 1, is_owner: 1 } },
-      )
+      ))
+      user = found && { ...found }
     } catch (err) {
       return next(err)
     }

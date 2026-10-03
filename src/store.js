@@ -36,8 +36,12 @@ export const withSession = (opts = {}) => {
 }
 const withProjection = (opts = {}) => ({ ...opts, projection: { ...NO_ID, ...(opts.projection || {}) } })
 
-// A collection whose calls join the current transaction and hide _id.
-function wrap(c) {
+// A collection whose calls join the current transaction and hide _id. Writes call onWrite (cache upkeep).
+function wrap(c, onWrite) {
+  const w = (fn) => (...args) => {
+    onWrite()
+    return fn(...args)
+  }
   return {
     raw: c,
     find: (filter = {}, opts) => c.find(filter, withSession(withProjection(opts))),
@@ -45,15 +49,15 @@ function wrap(c) {
     countDocuments: (filter = {}, opts) => c.countDocuments(filter, withSession(opts)),
     aggregate: (pipeline, opts) => c.aggregate(pipeline, withSession(opts)),
     distinct: (key, filter = {}, opts) => c.distinct(key, filter, withSession(opts)),
-    insertOne: (doc, opts) => c.insertOne(doc, withSession(opts)),
-    insertMany: (docs, opts) => c.insertMany(docs, withSession(opts)),
-    updateOne: (filter, update, opts) => c.updateOne(filter, update, withSession(opts)),
-    updateMany: (filter, update, opts) => c.updateMany(filter, update, withSession(opts)),
-    replaceOne: (filter, doc, opts) => c.replaceOne(filter, doc, withSession(opts)),
-    deleteOne: (filter, opts) => c.deleteOne(filter, withSession(opts)),
-    deleteMany: (filter, opts) => c.deleteMany(filter, withSession(opts)),
-    bulkWrite: (ops, opts) => c.bulkWrite(ops, withSession(opts)),
-    findOneAndUpdate: (filter, update, opts) => c.findOneAndUpdate(filter, update, withSession(withProjection({ returnDocument: 'after', ...opts }))),
+    insertOne: w((doc, opts) => c.insertOne(doc, withSession(opts))),
+    insertMany: w((docs, opts) => c.insertMany(docs, withSession(opts))),
+    updateOne: w((filter, update, opts) => c.updateOne(filter, update, withSession(opts))),
+    updateMany: w((filter, update, opts) => c.updateMany(filter, update, withSession(opts))),
+    replaceOne: w((filter, doc, opts) => c.replaceOne(filter, doc, withSession(opts))),
+    deleteOne: w((filter, opts) => c.deleteOne(filter, withSession(opts))),
+    deleteMany: w((filter, opts) => c.deleteMany(filter, withSession(opts))),
+    bulkWrite: w((ops, opts) => c.bulkWrite(ops, withSession(opts))),
+    findOneAndUpdate: w((filter, update, opts) => c.findOneAndUpdate(filter, update, withSession(withProjection({ returnDocument: 'after', ...opts })))),
   }
 }
 
@@ -62,11 +66,34 @@ export class Store {
     this.client = client
     this.db = db
     this.cache = new Map()
+    this.memo = new Map() // name -> { value, until } (see cached)
   }
 
   col(name) {
-    if (!this.cache.has(name)) this.cache.set(name, wrap(this.db.collection(name)))
+    if (!this.cache.has(name)) {
+      this.cache.set(name, wrap(this.db.collection(name), () => {
+        this.invalidate(name)
+        als.getStore()?.written?.add(name)
+      }))
+    }
     return this.cache.get(name)
+  }
+
+  // Short-lived in-memory copies of data read on almost every request (settings, the signed-in
+  // user, the item pick list). One Durable Object serves every request, so clearing on write
+  // keeps them correct; reads inside a transaction always go to the database.
+  async cached(collection, key, ttlMs, load) {
+    if (als.getStore()) return load()
+    const k = `${collection}:${key}`
+    const hit = this.memo.get(k)
+    if (hit && hit.until > Date.now()) return hit.value
+    const value = await load()
+    this.memo.set(k, { value, until: Date.now() + ttlMs })
+    return value
+  }
+
+  invalidate(collection) {
+    for (const k of this.memo.keys()) if (k.startsWith(`${collection}:`)) this.memo.delete(k)
   }
 
   get inTx() {
@@ -108,6 +135,7 @@ export class Store {
   async tx(fn) {
     if (als.getStore()) return fn()
     const session = this.client.startSession()
+    session.written = new Set()
     try {
       let result
       await session.withTransaction(async () => {
@@ -115,6 +143,8 @@ export class Store {
       })
       return result
     } finally {
+      // Again after commit/abort, in case a read filled the cache while the transaction was open.
+      for (const name of session.written) this.invalidate(name)
       await session.endSession()
     }
   }

@@ -118,11 +118,13 @@ export default function productRoutes(db) {
   })
 
   // Lightweight list for pick lists (purchase grid): no stock figures, only what a line needs.
+  // Kept in memory until any product changes (several thousand items, asked for by every purchase screen).
   r.get('/pick', async (req, res) => {
-    res.json(await products.find(req.query.all ? {} : { active: 1 }, {
+    const all = Boolean(req.query.all)
+    res.json(await db.cached('products', `pick:${all}`, 600000, () => products.find(all ? {} : { active: 1 }, {
       projection: { id: 1, name: 1, strength: 1, form: 1, barcode: 1, pack_size: 1, pack_price: 1, sale_price: 1, allow_loose: 1, packing: 1, active: 1 },
       sort: { name: 1 },
-    }).toArray())
+    }).toArray()))
   })
 
   // Exact barcode match, used by scanners.
