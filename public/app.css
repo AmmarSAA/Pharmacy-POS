@@ -275,3 +275,12 @@ a.alert-row.clear .count { color: var(--muted); }
 .icon { display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }
 .with-icon, button.link:has(> .icon) { display: inline-flex; align-items: center; gap: 4px; }
 .delta .icon { vertical-align: -0.1em; }
+
+/* Offline selling */
+.offline-note { display: none; padding: 8px 12px; border-radius: 6px; background: var(--warn-soft); color: var(--warn); font-size: 14px; }
+body.is-offline .offline-note { display: block; }
+nav.side .net { padding: 4px 10px; display: flex; flex-wrap: wrap; gap: 4px; font-size: 12px; }
+nav.side .net:empty { display: none; }
+.badge.warn { background: var(--warn-soft); color: var(--warn); }
+.search-box { position: relative; }
+.search-box .scan-btn { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); padding: 6px 8px; }

@@ -51,6 +51,24 @@ Cloudflare Workers at pharmacy.z88.tech or on any PC, and tills open it in a bro
 - Roles: **cashier** (sell, own sales only), **pharmacist** (plus controlled drugs, returns, stock, purchases, reports), **admin** (plus users and settings)
 - Reports: sales summary (net sales, discounts, returns, GST by rate, gross profit, cash in drawer, by staff, by day), top products, low stock/reorder list, expiry, stock valuation at cost and retail
 
+## Apps (installable, desktop, Android, offline)
+
+All of them open the same live pharmacy (https://pharmacy.z88.tech), so the data is shared.
+
+- **Install from the browser (any device)**: Chrome/Edge show *Install app*; on iPhone use Safari → Share →
+  *Add to Home Screen*. The app has its own icon and window (`public/manifest.webmanifest`, `public/sw.js`).
+- **Windows / Linux desktop** (`desktop/`, Electron): File → *Receipt printer…* picks the thermal printer, and
+  receipts then print straight to it with no dialog. Installers come from GitHub Actions (`.github/workflows/apps.yml`);
+  a `v*` tag publishes them as a GitHub Release.
+- **Android** (`mobile/`, Capacitor): the APK from the same workflow. Camera barcode scanning in the POS (also in
+  Chrome on Android). Set the `ANDROID_KEYSTORE_*` repository secrets so every APK is signed with the same key and
+  installs over the previous one.
+- **Offline selling** (`public/offline.js`): after one sign-in while online, the counter keeps working without
+  internet. It searches a downloaded copy of the catalogue, saves sales on the device and syncs them when the
+  connection is back. The server dates each synced sale when it happened, puts it in the till that was open then, and
+  never records it twice. Controlled drugs need the connection; sales the server refuses (for example the stock ran
+  out) are listed under *to review* in the side bar. Sync offline sales before closing the till.
+
 ## Running it
 
 Requires Node.js 22.5 or newer and a MongoDB database that supports transactions (MongoDB Atlas,

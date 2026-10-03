@@ -82,7 +82,8 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
     app.get('*', (req, res, next) => {
       const file = staticFiles[req.path === '/' ? '/index.html' : req.path]
       if (!file) return next()
-      res.type(file.type).set('cache-control', 'no-cache').send(file.body)
+      if (file.base64 && !file.buf) file.buf = Buffer.from(file.base64, 'base64')
+      res.type(file.type).set('cache-control', 'no-cache').send(file.buf || file.body)
     })
   }
 

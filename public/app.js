@@ -2,11 +2,12 @@
 // Money from the API is integer paisa; everything shown to people is rupees.
 import { mountAssistant, assistantOwnerSection } from './assistant.js'
 import { icon } from './icons.js'
+import { offline, syncNow, localStamp } from './offline.js'
 
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
 
-const state = { user: null, settings: {} }
+const state = { user: null, settings: {}, offline: false }
 
 // ---------- helpers ----------
 
@@ -28,19 +29,27 @@ const schedBadge = (s) =>
   s === 'otc' ? '' : `<span class="badge ${s}">${s === 'rx' ? 'Rx' : 'CONTROLLED'}</span>`
 
 async function api(method, path, body) {
-  const res = await fetch('/api' + path, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-    credentials: 'same-origin',
-  })
+  let res
+  try {
+    res = await fetch('/api' + path, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'same-origin',
+    })
+  } catch {
+    // No connection (or the server can't be reached): callers that can work offline check err.offline.
+    setOffline(true)
+    throw Object.assign(new Error('No internet connection. This needs the connection.'), { offline: true })
+  }
+  if (state.offline && res.status < 500) setOffline(false)
   const data = await res.json().catch(() => ({}))
   if (res.status === 401 && !path.startsWith('/auth/')) {
     state.user = null
     renderAuth()
     throw new Error(data.message || 'Please sign in')
   }
-  if (!res.ok) throw new Error(data.message || `Request failed (${res.status})`)
+  if (!res.ok) throw Object.assign(new Error(data.message || `Request failed (${res.status})`), { status: res.status })
   return data
 }
 const get = (p) => api('GET', p)
@@ -93,6 +102,13 @@ function formData(form) {
 }
 
 function printHtml(html, cls = '') {
+  // Desktop app: receipts go straight to the receipt printer chosen in File → Receipt printer.
+  if (!cls && window.pharmacyDesktop?.printReceipt) {
+    window.pharmacyDesktop.printReceipt(html, new URL('app.css', location.href).href)
+      .then((r) => (r?.ok ? toast(r.printer ? `Printed on ${r.printer}` : 'Printed') : toast(r?.error || 'Printing failed', true)))
+      .catch((e) => toast(e.message, true))
+    return
+  }
   const area = $('#print-area')
   area.className = cls
   area.innerHTML = html
@@ -228,18 +244,113 @@ function parseDelimited(text, delim) {
 // ---------- auth ----------
 
 async function boot() {
+  registerServiceWorker()
   try {
     const { user } = await api('GET', '/auth/me')
     state.user = user
     await loadSettings()
     renderShell()
-  } catch {
+  } catch (err) {
+    // Offline with an earlier sign-in on this device: open the counter with the saved session.
+    const saved = err.offline && offline.supported ? await offline.loadSession().catch(() => null) : null
+    if (saved?.user) {
+      state.user = saved.user
+      state.settings = saved.settings || {}
+      if (!location.hash.startsWith('#/pos')) location.hash = '#/pos'
+      renderShell()
+      return
+    }
+    if (err.offline) return renderOfflineGate()
     renderAuth()
   }
 }
 
 async function loadSettings() {
   state.settings = await get('/settings')
+  if (offline.supported) offline.saveSession(state.user, state.settings).catch(() => {})
+}
+
+function renderOfflineGate() {
+  $('#app').innerHTML = `<div class="auth"><div class="panel stack">
+    <h1>No internet connection</h1>
+    <p class="muted">Sign in once while online on this device; after that the counter can keep selling offline.</p>
+    <button class="primary" id="retry">Try again</button></div></div>`
+  $('#retry').addEventListener('click', () => boot())
+}
+
+// ---------- offline status & sync ----------
+
+function setOffline(v) {
+  if (state.offline === v) return
+  state.offline = v
+  document.body.classList.toggle('is-offline', v)
+  updateNetBadge()
+  if (!v) syncSoon()
+}
+
+async function updateNetBadge() {
+  const el = $('#net')
+  if (!el || !state.user) return
+  const c = offline.supported ? await offline.counts(state.user.id).catch(() => null) : null
+  const waiting = c ? c.mine : 0
+  const parts = []
+  if (state.offline) parts.push('<span class="badge expired">Offline</span>')
+  if (waiting) parts.push(`<span class="badge warn">${waiting} sale${waiting > 1 ? 's' : ''} to sync</span>`)
+  if (c?.others) parts.push(`<span class="badge">${c.others} from other users</span>`)
+  if (c?.problems) parts.push(`<button class="link danger" id="net-problems">${c.problems} to review</button>`)
+  el.innerHTML = parts.join(' ')
+  $('#net-problems', el)?.addEventListener('click', openOfflineProblems)
+}
+
+let syncTimer = null
+function syncSoon() {
+  clearTimeout(syncTimer)
+  syncTimer = setTimeout(() => syncNow({
+    user: state.user,
+    send: (body) => post('/sales', body),
+    onChange: updateNetBadge,
+  }).catch(() => {}), 500)
+}
+
+function startBackgroundSync() {
+  if (startBackgroundSync.started || !offline.supported) return
+  startBackgroundSync.started = true
+  window.addEventListener('online', () => { setOffline(false); syncSoon() })
+  window.addEventListener('offline', () => setOffline(true))
+  setInterval(() => {
+    if (!state.user) return
+    if (state.offline) get('/auth/me').catch(() => {}) // a light probe; success flips back online
+    else syncSoon()
+  }, 20000)
+}
+
+async function openOfflineProblems() {
+  const list = await offline.problems()
+  const m = modal(`<h2>Offline sales to review</h2>
+    <p class="muted">These were sold while offline but the server could not accept them (for example stock ran out, or a
+      limit applies). Fix the cause and try again, or remove the sale if it was entered by mistake.</p>
+    <div class="table-wrap"><table><thead><tr><th>When</th><th>Cashier</th><th class="num">Total</th><th>Problem</th><th></th></tr></thead><tbody>
+    ${list.map((p) => `<tr><td>${esc(p.offline_at)}</td><td>${esc(p.user_name)}</td><td class="num">${rs(p.preview?.total)}</td>
+      <td>${esc(p.error)}</td><td class="row"><button data-retry="${esc(p.offline_id)}">Try again</button>
+      <button class="link danger" data-discard="${esc(p.offline_id)}">Remove</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">Nothing to review.</td></tr>'}
+    </tbody></table></div>
+    <div class="actions"><button data-close>Close</button></div>`, { wide: true })
+  m.el.addEventListener('click', guard(async (e) => {
+    const r = e.target.closest('[data-retry]')
+    const d = e.target.closest('[data-discard]')
+    if (r) await offline.retry(r.dataset.retry)
+    if (d && confirm('Remove this offline sale? It will not be recorded.')) await offline.discard(d.dataset.discard)
+    if (r || d) {
+      m.close()
+      updateNetBadge()
+      syncSoon()
+    }
+  }))
+}
+
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator) || !(location.protocol === 'https:' || location.hostname === 'localhost')) return
+  navigator.serviceWorker.register('/sw.js').catch(() => {})
 }
 
 async function renderAuth() {
@@ -299,6 +410,7 @@ function renderShell() {
     <nav class="side">
       <div class="brand">${esc(state.settings.pharmacy_name)}</div>
       ${allowed().map((r) => `<a href="#/${r.path}" data-path="${r.path}">${r.label}</a>`).join('')}
+      <div class="net" id="net" aria-live="polite"></div>
       <div class="who">${esc(state.user.full_name)}<br><span>${esc(state.user.role)}${state.user.is_owner ? ' · owner' : ''}</span><br>
         <button class="link" id="logout">Sign out</button></div>
     </nav>
@@ -307,8 +419,13 @@ function renderShell() {
   $('#logout').addEventListener('click', guard(async () => {
     await post('/auth/logout')
     state.user = null
+    // Unsynced sales stay on the device; they sync when their cashier signs in again.
+    if (offline.supported) await offline.clearSession().catch(() => {})
     renderAuth()
   }))
+  startBackgroundSync()
+  updateNetBadge()
+  syncSoon()
   mountAssistant(assistantContext())
   route()
 }
@@ -640,6 +757,7 @@ function receiptHtml(sale) {
     ${s.ntn ? `<div class="c">NTN: ${esc(s.ntn)}${s.strn ? ` STRN: ${esc(s.strn)}` : ''}</div>` : ''}
     <hr>
     <div>Invoice: ${esc(sale.invoice_no)}</div>
+    ${sale.offline ? '<div>Offline sale: the final invoice number is given when it syncs.</div>' : ''}
     <div>Date: ${esc(sale.created_at)}</div>
     <div>Cashier: ${esc(sale.cashier_name)}</div>
     ${sale.customer_name ? `<div>Customer: ${esc(sale.customer_name)}</div>` : ''}
@@ -694,8 +812,11 @@ function posView(view) {
   view.innerHTML = `<div class="pos">
     <div class="stack">
       <div id="till-banner"></div>
+      <div class="offline-note">No internet connection. Sales are saved on this device and sync automatically when the
+        connection is back. Controlled drugs need the connection.</div>
       <div class="search-box">
         <input id="q" placeholder="Scan barcode or search medicine / generic name   (F2)" autocomplete="off">
+        ${'BarcodeDetector' in window ? `<button type="button" class="scan-btn" id="scan" title="Scan with camera" aria-label="Scan barcode with camera">${icon('camera', { size: 20 })}</button>` : ''}
         <div class="results" id="results" hidden></div>
       </div>
       <div class="panel" id="cart"></div>
@@ -732,9 +853,38 @@ function posView(view) {
       · expected cash <b>${rs(t.totals?.expected_cash)}</b> · <a href="#/till">Till</a></div>`
   }
 
+  // ---- offline catalogue: downloaded while online, searched locally when the connection is gone ----
+  let catalog = null
+  async function refreshCatalog(force = false) {
+    if (!offline.supported || state.offline) return
+    const saved = await offline.loadCatalog().catch(() => null)
+    if (!force && saved && Date.now() - saved.savedAt < 10 * 60000) return
+    const data = await get('/products/offline-catalog').catch(() => null)
+    if (data) await offline.saveCatalog(data.products, data.at).catch(() => {})
+    catalog = null
+  }
+  async function localSearch(text) {
+    if (!catalog) catalog = (await offline.loadCatalog().catch(() => null))?.products || []
+    const t = text.toLowerCase()
+    const exact = catalog.filter((p) => p.barcode && p.barcode.toLowerCase() === t)
+    const rest = catalog.filter((p) => !(p.barcode && p.barcode.toLowerCase() === t) && (
+      p.name.toLowerCase().includes(t) || (p.generic_name || '').toLowerCase().includes(t) || (p.barcode || '').toLowerCase().startsWith(t)))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    return [...exact, ...rest].slice(0, 20)
+  }
+  refreshCatalog()
+
   async function search(text) {
     const seq = ++searchSeq
-    const list = text ? await get(`/products?q=${encodeURIComponent(text)}&limit=20`) : []
+    let list = []
+    if (text) {
+      try {
+        list = state.offline ? await localSearch(text) : await get(`/products?q=${encodeURIComponent(text)}&limit=20`)
+      } catch (err) {
+        if (!err.offline) throw err
+        list = await localSearch(text)
+      }
+    }
     if (seq !== searchSeq) return null
     pos.results = list
     pos.hl = 0
@@ -908,11 +1058,21 @@ function posView(view) {
     pos.busy = true
     renderSide()
     try {
-      const sale = await post('/sales', body)
+      let sale
+      try {
+        if (state.offline) throw Object.assign(new Error('offline'), { offline: true })
+        sale = await post('/sales', body)
+      } catch (err) {
+        if (!err.offline || !offline.supported) throw err
+        sale = await sellOffline(body, t)
+        if (!sale) return
+      }
       reset()
+      refreshCatalog(true)
       // Server priced by batch and may round differently; cash tendered must still cover it.
       const m = modal(`
         <h2>Sale complete — ${esc(sale.invoice_no)}</h2>
+        ${sale.offline ? '<p class="alert">Saved on this device (no connection). It will sync automatically when the connection is back.</p>' : ''}
         ${sale.change_due ? `<p style="font-size:22px">Change due: <b>${rs(sale.change_due)}</b></p>` : ''}
         <div style="background:#fff;border:1px solid var(--border);border-radius:6px;padding:8px;max-height:50vh;overflow:auto">${receiptHtml(sale)}</div>
         <div class="actions"><button id="print">Print receipt</button><button class="primary" data-close>New sale (Enter)</button></div>`,
@@ -924,6 +1084,38 @@ function posView(view) {
       loadTill()
     }
   })
+
+  // No connection: the sale is kept on this device and synced later. Controlled drugs need the
+  // connection (the register is kept live). Returns a receipt-shaped object, or null if refused.
+  async function sellOffline(body, t) {
+    if (needsControlled()) {
+      toast('Controlled drugs cannot be sold offline. Wait for the connection.', true)
+      return null
+    }
+    const items = pos.cart.map((l) => {
+      const ps = l.product.pack_size || 1
+      const units = lineUnits(l)
+      const gross = lineGross(l)
+      const discount = Math.round((gross * l.discount) / 100)
+      return {
+        product_id: l.product.id, product_name: l.product.name, strength: l.product.strength, schedule: l.product.schedule,
+        qty: units, pack_size: ps, pack_price: packPriceOf(l.product), unit_price: Math.round(packPriceOf(l.product) / ps),
+        discount, discount_bps: Math.round(l.discount * 100), line_total: gross - discount, batch_no: '-', expiry_date: l.product.next_expiry || '',
+      }
+    })
+    const paid = body.amount_paid ?? t.total
+    const preview = { total: t.total, subtotal: t.subtotal, discount: t.discount, round_off: t.roundOff, items }
+    const q = await offline.queueSale({ user: state.user, body, preview })
+    await offline.takeStock(items.map((i) => ({ product_id: i.product_id, units: i.qty })))
+    catalog = null
+    updateNetBadge()
+    return {
+      invoice_no: `OFFLINE-${q.offline_id.slice(0, 8).toUpperCase()}`, created_at: q.offline_at, cashier_name: state.user.full_name,
+      customer_name: body.customer_name || body.prescription?.patient_name || '', prescription: body.prescription || null,
+      items, subtotal: t.subtotal, discount: t.discount, round_off: t.roundOff, total: t.total, tax: 0,
+      payment_method: body.payment_method, amount_paid: paid, change_due: Math.max(0, paid - t.total), returns: [], offline: true,
+    }
+  }
 
   // Packs/loose edits: loose overflow rolls into packs; zero or over-stock reverts.
   function setQty(line, packs, loose) {
@@ -963,6 +1155,33 @@ function posView(view) {
       const pick = exact || list[pos.hl] || (list.length === 1 ? list[0] : null)
       if (pick) addToCart(pick)
       else toast(`No product matches "${text}"`, true)
+    }
+  }))
+  // Camera scanning (phones / the Android app): reads the code and adds the item like a scanner would.
+  $('#scan', view)?.addEventListener('click', guard(async () => {
+    const detector = new window.BarcodeDetector()
+    let stream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+    } catch {
+      return toast('Camera permission was denied', true)
+    }
+    let stop = false
+    const m = modal(`<h2>Scan barcode</h2><video id="cam" playsinline muted style="width:100%;border-radius:8px;background:#000"></video>
+      <p class="muted">Point the camera at the barcode.</p><div class="actions"><button data-close>Cancel</button></div>`,
+    { onClose: () => { stop = true; stream.getTracks().forEach((tr) => tr.stop()) } })
+    const video = $('#cam', m.el)
+    video.srcObject = stream
+    await video.play()
+    while (!stop) {
+      const codes = await detector.detect(video).catch(() => [])
+      if (codes.length) {
+        m.close()
+        q.value = codes[0].rawValue
+        q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+        return
+      }
+      await new Promise((r) => setTimeout(r, 200))
     }
   }))
   $('#results', view).addEventListener('click', (e) => {

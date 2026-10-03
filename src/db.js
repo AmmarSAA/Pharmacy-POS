@@ -40,7 +40,7 @@ const INDEXES = {
   batches: [[{ product_id: 1, batch_no: 1 }, { unique: true }], [{ product_id: 1, expiry_date: 1 }], [{ expiry_date: 1, qty_on_hand: 1 }]],
   purchases: [[{ supplier_id: 1, created_at: 1 }], [{ created_at: 1 }]],
   purchase_items: [[{ purchase_id: 1 }], [{ batch_id: 1 }]],
-  sales: [[{ invoice_no: 1 }, { unique: true }], [{ created_at: 1 }], [{ till_session_id: 1 }], [{ user_id: 1, created_at: 1 }]],
+  sales: [[{ invoice_no: 1 }, { unique: true }], [{ offline_id: 1 }, { unique: true, partialFilterExpression: { offline_id: { $type: 'string' } } }], [{ created_at: 1 }], [{ till_session_id: 1 }], [{ user_id: 1, created_at: 1 }]],
   sale_items: [[{ sale_id: 1 }], [{ product_id: 1 }], [{ created_at: 1 }]],
   returns: [[{ sale_id: 1 }], [{ created_at: 1 }], [{ till_session_id: 1 }]],
   return_items: [[{ return_id: 1 }], [{ sale_item_id: 1 }], [{ created_at: 1 }]],

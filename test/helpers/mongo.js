@@ -9,7 +9,7 @@ let n = 0
 
 export async function testStore() {
   if (!rs) {
-    rs = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } })
+    rs = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' }, instanceOpts: [{ launchTimeout: 60000 }] })
     client = await MongoClient.connect(rs.getUri())
   }
   return initDb(new Store(client, client.db(`test_${process.pid}_${n++}`)))

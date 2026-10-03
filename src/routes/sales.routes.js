@@ -2,6 +2,7 @@ import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
 import { today, nowStamp, getSettings } from '../db.js'
 import { escapeRegex } from './products.routes.js'
+import { addDays } from '../lib/supplier-ledger.js'
 import { HttpError, badRequest, notFound, reqInt, optInt, reqString, optString, optDate, oneOf } from '../lib/http.js'
 import { allocateFefo, moveStock } from '../lib/stock.js'
 import { percentOf, inclusiveTax, roundToRupee, packAmount } from '../lib/money.js'
@@ -30,6 +31,29 @@ function readPrescription(body, needsControlled) {
   return out
 }
 
+const STAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+
+function readOffline(body) {
+  if (body.offline_id === undefined || body.offline_id === null || body.offline_id === '') return null
+  const id = String(body.offline_id)
+  if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) throw badRequest('offline_id is not valid')
+  const at = String(body.offline_at || '')
+  if (!STAMP.test(at) || Number.isNaN(Date.parse(at.replace(' ', 'T')))) throw badRequest('offline_at must be YYYY-MM-DD HH:MM:SS')
+  const now = nowStamp()
+  if (at > now) throw badRequest('offline_at is in the future')
+  // Older than a week means a device sat offline far too long; a person should look at it.
+  if (at.slice(0, 10) < addDays(now.slice(0, 10), -7)) throw badRequest('This offline sale is more than 7 days old; enter it by hand')
+  return { id, at }
+}
+
+// The user's till that was open at a moment (opened before it, not yet closed then).
+async function tillAt(db, userId, at) {
+  return (await db.col('till_sessions').findOne(
+    { user_id: userId, opened_at: { $lte: at }, $or: [{ closed_at: null }, { closed_at: { $gte: at } }] },
+    { sort: { id: -1 } },
+  )) || null
+}
+
 export async function loadSale(db, id) {
   const sale = await db.get('sales', id)
   if (!sale) return null
@@ -52,12 +76,19 @@ export default function saleRoutes(db) {
   //         customer_name?, customer_phone?, prescription? }
   // Units per line = qty if given, else packs * pack_size + loose.
   r.post('/', async (req, res) => {
+    // A sale made while the counter was offline, synced now: offline_id makes the sync idempotent,
+    // offline_at is when it really happened (it is dated and assigned to the till open at that time).
+    const offline = readOffline(req.body)
+    if (offline) {
+      const done = await db.col('sales').findOne({ offline_id: offline.id }, { projection: { id: 1 } })
+      if (done) return res.status(200).json(await loadSale(db, done.id))
+    }
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('The cart is empty')
     const paymentMethod = oneOf(req.body.payment_method || 'cash', PAYMENT_METHODS, 'Payment method')
     const settings = await getSettings(db)
     const maxDiscount = maxDiscountFor(settings, req.user.role)
-    const onDate = today()
+    const onDate = offline ? offline.at.slice(0, 10) : today()
 
     // Merge duplicate lines for the same product so FEFO allocation sees the full quantity.
     const cart = new Map()
@@ -93,13 +124,17 @@ export default function saleRoutes(db) {
 
     const hasRx = products.some((l) => l.product.schedule !== 'otc')
     const hasControlled = products.some((l) => l.product.schedule === 'controlled')
+    if (hasControlled && offline) {
+      throw new HttpError(409, 'Controlled drugs cannot be sold offline; the register must be kept online')
+    }
     if (hasControlled && req.user.role === 'cashier') {
       throw new HttpError(403, 'Controlled drugs must be dispensed by a pharmacist')
     }
     const prescription = hasRx ? readPrescription(req.body, hasControlled) : null
-    const till = await tillForCash(db, req.user.id, settings, 'sell')
+    // Offline sales already happened: they go to the till that was open then (or none), never refused.
+    const till = offline ? await tillAt(db, req.user.id, offline.at) : await tillForCash(db, req.user.id, settings, 'sell')
 
-    const sale = await db.tx(async () => {
+    const createSale = () => db.tx(async () => {
       // Allocate stock and price every batch slice.
       const lines = []
       for (const l of products) {
@@ -139,7 +174,7 @@ export default function saleRoutes(db) {
       }
 
       const saleId = await db.nextId('sales')
-      const stamp = nowStamp()
+      const stamp = offline ? offline.at : nowStamp()
       await db.col('sales').insertOne({
         _id: saleId, id: saleId, invoice_no: `INV-${String(saleId).padStart(6, '0')}`, user_id: req.user.id,
         customer_name: optString(req.body, 'customer_name') || prescription?.patient_name || null,
@@ -147,6 +182,7 @@ export default function saleRoutes(db) {
         prescription_id: prescriptionId, subtotal, discount, tax, round_off: roundOff, total, payment_method: paymentMethod,
         amount_paid: amountPaid, change_due: amountPaid - total, till_session_id: till?.id ?? null, created_at: stamp,
         has_controlled: hasControlled ? 1 : 0,
+        ...(offline && { offline_id: offline.id, synced_at: nowStamp() }),
       })
 
       let itemId = await db.reserveIds('sale_items', lines.length)
@@ -165,6 +201,17 @@ export default function saleRoutes(db) {
       return saleId
     })
 
+    let sale
+    try {
+      sale = await createSale()
+    } catch (err) {
+      // The same offline sale synced twice at once: the second one returns the first.
+      if (offline && err.code === 11000) {
+        const done = await db.col('sales').findOne({ offline_id: offline.id }, { projection: { id: 1 } })
+        if (done) return res.status(200).json(await loadSale(db, done.id))
+      }
+      throw err
+    }
     res.status(201).json(await loadSale(db, sale))
   })
 

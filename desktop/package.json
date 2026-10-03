@@ -1,0 +1,47 @@
+{
+  "name": "pharmacy-pos-desktop",
+  "productName": "Pharmacy POS",
+  "version": "1.0.0",
+  "description": "Pharmacy POS desktop app: the counter, stock and reports in their own window, with direct receipt printing",
+  "author": "Syed Ammar Ahmed",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux --publish never"
+  },
+  "build": {
+    "appId": "tech.z88.pharmacy",
+    "productName": "Pharmacy POS",
+    "artifactName": "Pharmacy-POS-${version}-${os}-${arch}.${ext}",
+    "directories": { "output": "dist", "buildResources": "build" },
+    "files": ["main.js", "preload.js", "offline.html", "build/icon.png", "package.json"],
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "icon": "build/icon.png" },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Pharmacy POS"
+    },
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["universal"] }],
+      "category": "public.app-category.business",
+      "icon": "build/icon.png",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Pharmacy POS uses the microphone when you speak to the assistant.",
+        "NSCameraUsageDescription": "Pharmacy POS uses the camera to scan barcodes."
+      }
+    },
+    "linux": { "target": ["AppImage", "deb"], "category": "Office", "icon": "build/icon.png", "maintainer": "Syed Ammar Ahmed" }
+  },
+  "devDependencies": {
+    "electron": "^44.5.0",
+    "electron-builder": "^26.15.3"
+  }
+}

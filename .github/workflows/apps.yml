@@ -1,0 +1,124 @@
+name: Desktop & Android apps
+
+# Builds the desktop installers (Windows, Linux) and the Android APK.
+# - Every push to main that touches desktop/ or mobile/ → downloadable artifacts on the run page.
+# - Pushing a tag like v1.0.0, or running the workflow manually with a version (Actions → Run workflow),
+#   also publishes a GitHub Release with the files attached.
+on:
+  push:
+    branches: [main]
+    paths: ['desktop/**', 'mobile/**', '.github/workflows/apps.yml']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a GitHub Release with this version tag (e.g. v1.0.0). Leave empty to only build.'
+        required: false
+        default: ''
+
+concurrency:
+  group: apps-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - name: Build installer
+        run: npx electron-builder --publish never
+        env:
+          # No code-signing certificate yet: Windows shows "unknown publisher" on first install.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+      - run: npx cap sync android
+      - name: Build APK
+        working-directory: mobile/android
+        # With the ANDROID_KEYSTORE_* secrets set, the APK is signed with the same key every time and
+        # installs over older versions. Without them it is a debug build (new key each run).
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$ANDROID_KEYSTORE_PATH"
+            ./gradlew assembleRelease --no-daemon
+            mv app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/Pharmacy-POS-android.apk"
+          else
+            echo "::warning::ANDROID_KEYSTORE_* secrets are not set, so this is a debug APK that cannot update an earlier install"
+            ./gradlew assembleDebug --no-daemon
+            mv app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/Pharmacy-POS-android.apk"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          if-no-files-found: error
+          path: Pharmacy-POS-android.apk
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.release, 'v')
+    needs: [desktop, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          tag_name: ${{ github.event.inputs.release || github.ref_name }}
+          name: Pharmacy POS ${{ github.event.inputs.release || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          body_path: .github/release-notes.md

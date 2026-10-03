@@ -16,6 +16,8 @@ const PATHS = {
   'arrow-right': '<path d="M5 12h14M12 5l7 7-7 7"/>',
   minus: '<path d="M5 12h14"/>',
   'chevron-right': '<path d="M9 6l6 6-6 6"/>',
+  camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
 }
 
 export function icon(name, { size = 16, cls = '' } = {}) {

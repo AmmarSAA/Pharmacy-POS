@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Pharmacy POS</string>
+    <string name="title_activity_main">Pharmacy POS</string>
+    <string name="package_name">tech.z88.pharmacy</string>
+    <string name="custom_url_scheme">tech.z88.pharmacy</string>
+</resources>

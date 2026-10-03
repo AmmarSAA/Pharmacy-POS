@@ -127,6 +127,34 @@ export default function productRoutes(db) {
     }).toArray()))
   })
 
+  // Everything the counter needs to keep selling offline: active items with sellable stock, FEFO
+  // price and next expiry. Two queries and a merge (a per-item lookup would be slow over 10,000 items).
+  r.get('/offline-catalog', async (req, res) => {
+    const t = today()
+    const [items, stock] = await Promise.all([
+      products.find({ active: 1 }, { projection: {
+        id: 1, name: 1, generic_name: 1, strength: 1, form: 1, barcode: 1, manufacturer: 1, pack_size: 1, pack_price: 1,
+        sale_price: 1, allow_loose: 1, packing: 1, schedule: 1, shelf_location: 1, gst_rate_bps: 1,
+      } }).toArray(),
+      db.col('batches').aggregate([
+        { $match: { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } } },
+        { $sort: { expiry_date: 1, id: 1 } },
+        { $group: {
+          _id: '$product_id', stock: { $sum: '$qty_on_hand' }, next_expiry: { $first: '$expiry_date' },
+          current_price: { $first: '$sale_price' }, current_pack_price: { $first: '$pack_price' },
+        } },
+      ]).toArray(),
+    ])
+    const byId = new Map(stock.map((x) => [x._id, x]))
+    res.json({
+      at: nowStamp(),
+      products: items.map((p) => {
+        const s = byId.get(p.id)
+        return { ...p, stock: s?.stock || 0, next_expiry: s?.next_expiry || null, current_price: s?.current_price ?? null, current_pack_price: s?.current_pack_price ?? null }
+      }),
+    })
+  })
+
   // Exact barcode match, used by scanners.
   r.get('/barcode/:code', async (req, res) => {
     const [p] = await productsWithStock(db, { barcode: req.params.code, active: 1 }, { limit: 1 })

@@ -1,0 +1,20 @@
+{
+  "appId": "tech.z88.pharmacy",
+  "appName": "Pharmacy POS",
+  "webDir": "www",
+  "server": {
+    "url": "https://pharmacy.z88.tech",
+    "errorPath": "offline.html",
+    "androidScheme": "https"
+  },
+  "android": {
+    "backgroundColor": "#0f7b6c"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 800,
+      "backgroundColor": "#0f7b6c",
+      "showSpinner": false
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "pharmacy-pos-mobile",
+  "version": "1.0.0",
+  "description": "Pharmacy POS Android app: the live pharmacy site with camera barcode scanning",
+  "author": "Syed Ammar Ahmed",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "sync": "cap sync",
+    "assets": "capacitor-assets generate --android --iconBackgroundColor '#0f7b6c' --splashBackgroundColor '#0f7b6c'",
+    "android:debug": "cap sync android && cd android && ./gradlew assembleDebug",
+    "android:release": "cap sync android && cd android && ./gradlew assembleRelease",
+    "open:android": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/core": "^8.5.2",
+    "@capacitor/splash-screen": "^8.0.2"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^8.5.2"
+  }
+}
