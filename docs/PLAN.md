@@ -120,3 +120,19 @@ should be configurable; department issues needed; MultiTec data to follow.
 - Received a 14.8 MB `MultiTec_Data.MDF`: item master only (10,770 items, 417 manufacturers), no
   stock, suppliers or history. Exported to an import CSV and import-tested (twice, idempotent) on the
   Cloudflare runtime. Steps in `docs/MIGRATION.md`.
+
+## Round 3 (dashboards and assistant)
+
+- Dashboard (`GET /api/dashboard`) is the first screen and is scoped by role. Owner/admin: sales vs
+  yesterday, gross profit, cash in open tills, supplier dues, stock value, ward issues, 7-day chart,
+  getting-started steps. Pharmacist: sales, prescriptions and controlled sales, own sales, open
+  requisitions, stock alerts. Cashier: own sales, cash in their drawer, till actions. Refreshes every minute.
+- Assistant (`/api/assistant`), same design as the ColdStore ERP assistant: Groq
+  (`openai/gpt-oss-120b`), English and Urdu, voice notes (Whisper). Tools call the app's own API as the
+  signed-in user, so roles and validation are the same as on screen. Reads run on their own; changes
+  (prices, schedules, supplier payments, departments, requisitions) wait for Approve and run once.
+  Chats are per user. The owner switches it on/off and manages the key in the Owner panel; the
+  `GROQ_API_KEY` Worker secret takes precedence over a saved key.
+- Tests: 83 on Node (including scripted assistant runs); workflow and API suites on the Cloudflare
+  runtime; browser check as owner, pharmacist and cashier (desktop and phone width) with live Groq on
+  both runtimes: stock question, approval card, Urdu answer, no console errors.

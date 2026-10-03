@@ -36,6 +36,16 @@ on the shop network open it in a browser. No internet connection or cloud databa
   running balance, and a dues report with aging buckets and overdue bills
 - Import the item list by pasting from Excel or a CSV; MultiTec column names are recognised
 
+**Dashboard and assistant** (Round 3)
+- Each user lands on a dashboard for their job: the owner/admin sees sales vs yesterday, gross profit,
+  cash in open tills, supplier dues, stock value, ward issues and a 7-day chart; pharmacists see sales,
+  prescriptions, requisitions and stock alerts; cashiers see their own sales, their drawer and till actions
+- In-app assistant (button at the bottom right): ask in English or Urdu, by typing or voice note, about
+  stock, expiry, prices, sales, suppliers, dues and departments. It can also change prices or schedules,
+  record supplier payments, add departments and raise requisitions, but only after the user taps Approve.
+  It sees and does only what the signed-in user's role allows; every action is in the audit log
+- The owner switches it on or off and manages the Groq API key in the Owner panel
+
 **Purchasing, users & reports**
 - Suppliers (with NTN and drug licence number) and stock receiving against supplier invoices, including bonus units
 - Roles: **cashier** (sell, own sales only), **pharmacist** (plus controlled drugs, returns, stock, purchases, reports), **admin** (plus users and settings)
@@ -70,6 +80,7 @@ npm run seed
 | `COOKIE_SECURE` | off                  | Set to `1` when serving over HTTPS                        |
 | `SETUP_TOKEN`   | none                 | If set, creating the first admin account requires this token. **Always set it on a public server.** |
 | `TRUST_PROXY`   | off                  | Number of reverse-proxy hops in front of the app, so login rate limiting sees real client IPs |
+| `GROQ_API_KEY`  | none                 | Key for the assistant (Groq). Without it the owner can save one in the Owner panel (stored encrypted) |
 
 Pharmacy name, address, licence numbers, default GST rate, expiry warning window, rounding and receipt
 footer are set in the app under **Settings**.
@@ -95,6 +106,7 @@ storage is the database (`worker/sql-storage-db.js` adapts it to the `node:sqlit
 Cloudflare Workers Builds deploys every push to `main` with `npx wrangler deploy`, using `wrangler.jsonc`.
 
 - `SETUP_TOKEN` is a Worker secret: `npx wrangler secret put SETUP_TOKEN`
+- `GROQ_API_KEY` is a Worker secret for the assistant: `npx wrangler secret put GROQ_API_KEY`
 - `UTC_OFFSET_MINUTES` (default 300 = Pakistan) sets the pharmacy's local time, since Workers run on UTC
 - Local run in the Workers runtime: `npx wrangler dev`, then `TEST_BASE_URL=http://localhost:8787 npm test`
   runs the API tests against it (on an empty database)

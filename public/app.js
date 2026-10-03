@@ -267,7 +267,7 @@ async function renderAuth() {
     const { user } = await post(needsSetup ? '/auth/setup' : '/auth/login', formData(e.target))
     state.user = user
     await loadSettings()
-    location.hash = '#/pos'
+    location.hash = '#/home'
     renderShell()
   }))
 }
@@ -275,6 +275,7 @@ async function renderAuth() {
 // ---------- shell & routing ----------
 
 const ROUTES = [
+  { path: 'home', label: 'Dashboard', view: dashboardView },
   { path: 'pos', label: 'Point of sale', view: posView },
   { path: 'till', label: 'Till', view: tillView },
   { path: 'sales', label: 'Sales & returns', view: salesView },
@@ -290,6 +291,7 @@ const ROUTES = [
 ]
 const allowed = () => ROUTES.filter((r) => (!r.roles || can(...r.roles)) && (!r.ownerOnly || state.user?.is_owner))
 let teardown = null
+let routeSeq = 0
 
 function renderShell() {
   $('#app').innerHTML = `<div class="shell">
@@ -317,7 +319,7 @@ function assistantContext() {
 
 function route() {
   if (!state.user || !$('#view')) return
-  const path = location.hash.replace(/^#\//, '').split('?')[0] || 'pos'
+  const path = location.hash.replace(/^#\//, '').split('?')[0] || 'home'
   const r = allowed().find((x) => x.path === path) || allowed()[0]
   $$('nav.side a').forEach((a) => a.classList.toggle('active', a.dataset.path === r.path))
   teardown?.()
@@ -325,9 +327,290 @@ function route() {
   $('#modal-root').innerHTML = ''
   const view = $('#view')
   view.innerHTML = ''
-  Promise.resolve(r.view(view)).then((t) => (teardown = typeof t === 'function' ? t : null)).catch((e) => toast(e.message, true))
+  // A view that finishes after the user has moved on is torn down at once.
+  const seq = ++routeSeq
+  Promise.resolve(r.view(view)).then((t) => {
+    if (typeof t !== 'function') return
+    if (seq === routeSeq) teardown = t
+    else t()
+  }).catch((e) => toast(e.message, true))
 }
 window.addEventListener('hashchange', route)
+
+// ---------- dashboard ----------
+
+const DASH_REFRESH_MS = 60000
+const compactNum = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 })
+const rsShort = (paisa) => `Rs ${compactNum.format(Math.round(Number(paisa || 0) / 100))}`
+const plural = (n, word) => `${Number(n).toLocaleString('en-PK')} ${word}${n === 1 ? '' : 's'}`
+const dayLabel = (iso, opts) => new Date(`${iso}T12:00:00`).toLocaleDateString('en-GB', opts)
+const greeting = () => {
+  const h = new Date().getHours()
+  return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'
+}
+
+// Stat card; with href the whole card is a link.
+function statCard(label, value, sub = '', href = '') {
+  const inner = `<div class="label">${esc(label)}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ''}`
+  return href ? `<a class="card card-link" href="${esc(href)}">${inner}</a>` : `<div class="card">${inner}</div>`
+}
+
+// Change against yesterday, as text (no colour-only meaning).
+function deltaText(now, before) {
+  if (!before) return now ? 'Yesterday: Rs 0.00' : 'No sales yesterday either'
+  const p = Math.round(((now - before) / before) * 100)
+  const arrow = p > 0 ? '▲' : p < 0 ? '▼' : '='
+  return `<span class="delta ${p < 0 ? 'down' : p > 0 ? 'up' : ''}">${arrow} ${Math.abs(p)}%</span> vs yesterday (${rs(before)})`
+}
+
+// 7-day sales: SVG bars (one series, no legend) with HTML labels and per-day hover/focus targets.
+function salesChartHtml(series) {
+  const max = Math.max(...series.map((d) => d.total), 0)
+  const W = 70
+  const H = 150
+  const barW = 36
+  const total = series.reduce((s, d) => s + d.total, 0)
+  const last = series.length - 1
+  const bars = series.map((d, i) => {
+    const h = max ? Math.max(d.total > 0 ? 3 : 0, Math.round((d.total / max) * (H - 4))) : 0
+    return h ? `<rect x="${i * W + (W - barW) / 2}" y="${H - h}" width="${barW}" height="${h}" rx="3" class="${i === last ? 'today' : ''}"></rect>` : ''
+  }).join('')
+  const label = (d, i) => `${dayLabel(d.day, { weekday: 'long', day: 'numeric', month: 'short' })}${i === last ? ' (today)' : ''}: ${rs(d.total)}, ${plural(d.invoices, 'invoice')}`
+  // Direct labels only on today and the best day.
+  const peak = max ? series.findIndex((d) => d.total === max) : -1
+  return `<figure class="chart" aria-labelledby="chart-title">
+    <figcaption class="row"><h2 id="chart-title" style="margin:0">Sales, last 7 days</h2><div class="spacer"></div>
+      <span class="muted" style="font-size:13px">${rs(total)} · ${plural(series.reduce((s, d) => s + d.invoices, 0), 'invoice')}</span></figcaption>
+    <div class="chart-vals" aria-hidden="true">${series.map((d, i) => `<span>${(i === last || i === peak) && d.total ? esc(rsShort(d.total)) : ''}</span>`).join('')}</div>
+    <div class="chart-plot">
+      <svg viewBox="0 0 ${W * series.length} ${H}" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <line x1="0" y1="${H - 0.5}" x2="${W * series.length}" y2="${H - 0.5}" class="axis" vector-effect="non-scaling-stroke"></line>${bars}
+      </svg>
+      <div class="chart-hits">${series.map((d, i) => `<span tabindex="0" role="img" aria-label="${esc(label(d, i))}" data-tip="${esc(label(d, i))}"></span>`).join('')}</div>
+      ${max ? '' : '<div class="chart-empty muted">No sales in the last 7 days</div>'}
+      <div class="chart-tip" hidden></div>
+    </div>
+    <div class="chart-days" aria-hidden="true">${series.map((d, i) => `<span class="${i === last ? 'today' : ''}">${esc(i === last ? 'Today' : dayLabel(d.day, { weekday: 'short' }))}</span>`).join('')}</div>
+  </figure>`
+}
+
+function bindChart(root) {
+  const plot = $('.chart-plot', root)
+  if (!plot) return
+  const tip = $('.chart-tip', plot)
+  const show = (e) => {
+    const cell = e.target.closest('[data-tip]')
+    if (!cell) return
+    tip.textContent = cell.dataset.tip
+    tip.hidden = false
+    const pr = plot.getBoundingClientRect()
+    const cr = cell.getBoundingClientRect()
+    const x = Math.min(Math.max(cr.left - pr.left + cr.width / 2 - tip.offsetWidth / 2, 0), pr.width - tip.offsetWidth)
+    tip.style.left = `${x}px`
+  }
+  const hide = () => { tip.hidden = true }
+  plot.addEventListener('mouseover', show)
+  plot.addEventListener('focusin', show)
+  plot.addEventListener('mouseleave', hide)
+  plot.addEventListener('focusout', hide)
+}
+
+function alertsHtml(a, openReq) {
+  const rows = []
+  const row = (n, level, title, hint, href) => rows.push(`<a class="alert-row ${n ? level : 'clear'}" href="${esc(href)}">
+    <span class="count">${esc(Number(n).toLocaleString('en-PK'))}</span><span class="what"><b>${esc(title)}</b><span class="muted">${esc(hint)}</span></span>
+    <span class="go" aria-hidden="true">›</span></a>`)
+  if (a.unpriced_items) {
+    row(a.unpriced_items, 'bad', `${a.unpriced_items === 1 ? 'Item' : 'Items'} without a price`,
+      `${a.unpriced_in_stock ? `${a.unpriced_in_stock.toLocaleString('en-PK')} in stock. ` : ''}Set pack prices before selling.`, '#/products?unpriced=1')
+  }
+  if (a.expired) row(a.expired, 'bad', `Expired ${a.expired === 1 ? 'batch' : 'batches'} on hand`, 'Write off or return to supplier.', '#/stock?s=expired')
+  row(a.near_expiry, 'warn', `${a.near_expiry === 1 ? 'Batch expires' : 'Batches expire'} within ${a.near_expiry_days} days`, 'Sell first or return to supplier.', '#/stock?s=near')
+  row(a.low_stock, 'warn', 'Low stock', 'At or below the reorder level.', '#/reports?tab=low')
+  if (openReq) row(openReq, 'info', `Open ward ${openReq === 1 ? 'requisition' : 'requisitions'}`, 'Waiting to be issued.', '#/issues?tab=requisitions')
+  const allClear = !a.unpriced_items && !a.expired && !a.near_expiry && !a.low_stock
+  return `<section class="panel"><h2>Alerts</h2>
+    ${allClear ? '<p class="muted" style="margin:0 0 8px">Nothing needs attention. Stock, expiry and prices look fine.</p>' : ''}
+    <div class="alert-list">${rows.join('')}</div></section>`
+}
+
+function tillPanelHtml(t) {
+  if (!t) {
+    return `<section class="panel"><h2>My till</h2>
+      <p style="margin:0 0 10px"><span class="badge expired">Closed</span>
+        <span class="muted">${state.settings.require_open_till === '1' ? 'Open your till before taking cash.' : 'Open a till to track the cash in your drawer.'}</span></p>
+      <div class="row"><button class="primary" data-act="open-till">Open till</button><a class="link" href="#/till">Till page</a></div></section>`
+  }
+  const x = t.totals || {}
+  return `<section class="panel"><h2>My till</h2>
+    <p style="margin:0 0 10px"><span class="badge ok">Open</span> <span class="muted">since ${esc(time(t.session.opened_at))}</span></p>
+    <div class="till-figs">
+      <div><span class="muted">Expected cash</span><b class="num big">${rs(x.expected_cash)}</b></div>
+      <div><span class="muted">Opening</span><span class="num">${rs(x.opening_cash)}</span></div>
+      <div><span class="muted">Cash sales</span><span class="num">${rs(x.cash_sales)}</span></div>
+      <div><span class="muted">Card / wallet</span><span class="num">${rs((x.card_sales || 0) + (x.wallet_sales || 0))}</span></div>
+      ${x.refunds ? `<div><span class="muted">Cash refunds</span><span class="num">-${rs(x.refunds)}</span></div>` : ''}
+      ${x.cash_in || x.cash_out ? `<div><span class="muted">Cash in / out</span><span class="num">${rs(x.cash_in)} / ${rs(x.cash_out)}</span></div>` : ''}
+    </div>
+    <div class="row" style="margin-top:10px"><button data-act="close-till">Close till</button><a class="link" href="#/till">Till details</a></div></section>`
+}
+
+function listPanel(title, body, more = '') {
+  return `<section class="panel"><div class="row"><h2>${esc(title)}</h2><div class="spacer"></div>${more}</div>${body}</section>`
+}
+
+function recentSalesHtml(rows, staff, date) {
+  if (!rows.length) {
+    return listPanel(staff ? 'Recent sales' : 'My recent sales',
+      `<p class="muted" style="margin:0">No sales yet. Completed sales from the <a class="link" href="#/pos">point of sale</a> show here.</p>`)
+  }
+  return listPanel(staff ? 'Recent sales' : 'My recent sales', `<div class="table-wrap"><table class="dash-table">
+    <thead><tr><th>Invoice</th><th>Time</th>${staff ? '<th class="hide-sm">By</th>' : ''}<th class="num">Total</th></tr></thead>
+    <tbody>${rows.map((s) => `<tr class="clickable" data-sale="${esc(s.id)}" tabindex="0">
+      <td>${esc(s.invoice_no)} ${s.prescription_id ? '<span class="badge rx">Rx</span>' : ''}
+        ${s.customer_name ? `<div class="muted small">${esc(s.customer_name)}</div>` : ''}</td>
+      <td>${esc(String(s.created_at).slice(0, 10) === date ? time(s.created_at) : String(s.created_at).slice(0, 10))}</td>
+      ${staff ? `<td class="hide-sm">${esc(s.cashier_name)}</td>` : ''}
+      <td class="num">${rs(s.total)}<div class="muted small">${esc(s.payment_method)}</div></td></tr>`).join('')}</tbody></table></div>`,
+  '<a class="link" href="#/sales">All sales</a>')
+}
+
+function dashboardHtml(d) {
+  const c = d.cards
+  const l = d.lists
+  const staff = !!c.alerts
+  const admin = !!c.stock_value
+  const tillOpen = !!c.my_till
+  const name = String(state.user.full_name || '').split(' ')[0]
+
+  const actions = admin
+    ? [['#/purchases?new=1', 'Receive stock', true], ['#/reports?tab=dues', 'Supplier dues'], ['#/reports', 'Reports']]
+    : staff
+      ? [['#/pos', 'New sale', true], ['#/issues', 'Issue to ward'], ['#/stock?s=near', 'Expiring stock']]
+      : [[tillOpen ? '#/pos' : '', tillOpen ? 'New sale' : 'Open till', true], [tillOpen ? '' : '#/pos', tillOpen ? 'Close till' : 'New sale']]
+  const actionHtml = actions.map(([href, label, primary]) => href
+    ? `<a class="btn ${primary ? 'primary' : ''}" href="${esc(href)}">${esc(label)}</a>`
+    : `<button class="${primary ? 'primary' : ''}" data-act="${label === 'Open till' ? 'open-till' : 'close-till'}">${esc(label)}</button>`).join('')
+
+  const cards = []
+  if (admin) {
+    cards.push(statCard('Sales today', rs(c.sales_today.total), `${plural(c.sales_today.invoices, 'invoice')}<br>${deltaText(c.sales_today.total, c.sales_yesterday.total)}`, '#/reports'))
+    cards.push(statCard('Gross profit today', rs(c.gross_profit_today), 'Excludes GST, after returns', '#/reports'))
+    cards.push(statCard('Cash in open tills', rs(c.cash_in_open_tills.expected_cash), c.cash_in_open_tills.tills ? `${plural(c.cash_in_open_tills.tills, 'till')} open` : 'No till open', '#/till'))
+    cards.push(statCard('Owed to suppliers', rs(c.supplier_dues.balance),
+      c.supplier_dues.overdue ? `<span class="warn-text">${rs(c.supplier_dues.overdue)} overdue</span> · ${plural(c.supplier_dues.suppliers_overdue, 'supplier')}` : 'Nothing overdue', '#/reports?tab=dues'))
+    cards.push(statCard('Stock value (cost)', rs(c.stock_value.cost), `Retail ${rs(c.stock_value.retail)}`, '#/reports?tab=valuation'))
+    cards.push(statCard('Issued to wards today', rs(c.issues_today.cost), plural(c.issues_today.count, 'issue'), '#/issues?tab=issued'))
+  } else if (staff) {
+    cards.push(statCard('Sales today', rs(c.sales_today.total), plural(c.sales_today.invoices, 'invoice'), '#/sales'))
+    cards.push(statCard('Prescriptions today', esc(c.sales_today.prescriptions), `${plural(c.sales_today.controlled, 'controlled-drug sale')}`, '#/sales'))
+    cards.push(statCard('My sales today', rs(c.my_sales_today.total), plural(c.my_sales_today.invoices, 'invoice')))
+    cards.push(statCard('Open requisitions', esc(c.open_requisitions), 'From wards', '#/issues?tab=requisitions'))
+  } else {
+    cards.push(statCard('My sales today', rs(c.my_sales_today.total), plural(c.my_sales_today.invoices, 'invoice')))
+    cards.push(statCard('Cash in my drawer', tillOpen ? rs(c.my_till.totals?.expected_cash) : '—', tillOpen ? 'Expected, from your open till' : 'Till closed', '#/till'))
+  }
+
+  const panels = []
+  if (staff) panels.push(alertsHtml(c.alerts, c.open_requisitions))
+  panels.push(tillPanelHtml(c.my_till))
+  if (admin) {
+    const s7 = d.charts.sales_7d || []
+    // A brand-new pharmacy: point at the first steps.
+    if (!c.stock_value.cost && s7.every((x) => !x.total)) {
+      panels.unshift(`<section class="panel"><h2>Getting started</h2><ol class="steps">
+        <li><a class="link" href="#/products">Add or import your products</a> with pack prices.</li>
+        <li><a class="link" href="#/purchases?new=1">Receive stock</a> with batch numbers and expiry dates.</li>
+        <li><a class="link" href="#/users">Add staff</a> (pharmacists and cashiers).</li>
+        <li>Open a till and make your first sale.</li></ol></section>`)
+    }
+    panels.push(`<section class="panel wide">${salesChartHtml(s7)}</section>`)
+    const top = l.top_products_today || []
+    panels.push(listPanel('Top products today', top.length ? `<div class="table-wrap"><table class="dash-table">
+      <thead><tr><th>Product</th><th class="num">Units</th><th class="num">Revenue</th></tr></thead>
+      <tbody>${top.map((p) => `<tr><td>${esc(p.name)} ${esc(p.strength || '')}</td><td class="num">${esc(p.qty)}</td><td class="num">${rs(p.revenue)}</td></tr>`).join('')}</tbody></table></div>`
+      : '<p class="muted" style="margin:0">No sales yet today.</p>', '<a class="link" href="#/reports?tab=top">More</a>'))
+  }
+  if (staff) {
+    const exp = l.expiring_soon || []
+    panels.push(listPanel('Expiring soon', exp.length ? `<div class="table-wrap"><table class="dash-table">
+      <thead><tr><th>Product</th><th class="hide-sm">Batch</th><th>Expiry</th><th class="num">Qty</th></tr></thead>
+      <tbody>${exp.map((b) => `<tr><td>${esc(b.product_name)} ${esc(b.strength || '')}</td><td class="hide-sm">${esc(b.batch_no)}</td>
+        <td><span class="badge near">${esc(b.days_to_expiry)}d</span> <span class="muted small">${esc(b.expiry_date)}</span></td><td class="num">${esc(b.qty_on_hand)}</td></tr>`).join('')}</tbody></table></div>`
+      : `<p class="muted" style="margin:0">No stock expires within ${esc(c.alerts.near_expiry_days)} days.</p>`, '<a class="link" href="#/stock?s=near">All</a>'))
+    const low = l.low_stock || []
+    panels.push(listPanel('Low stock', low.length ? `<div class="table-wrap"><table class="dash-table">
+      <thead><tr><th>Product</th><th class="num">In stock</th><th class="num">Reorder at</th></tr></thead>
+      <tbody>${low.map((p) => `<tr><td>${esc(p.name)} ${esc(p.strength || '')}</td><td class="num">${p.stock ? esc(packsText(p.stock, p.pack_size)) : '<span class="badge expired">None</span>'}</td>
+        <td class="num">${esc(p.reorder_level)}</td></tr>`).join('')}</tbody></table></div>`
+      : '<p class="muted" style="margin:0">Nothing is below its reorder level. Set reorder levels on products to get warnings here.</p>', '<a class="link" href="#/reports?tab=low">All</a>'))
+  }
+  panels.push(recentSalesHtml(l.recent_sales || [], staff, d.date))
+  if (l.recent_audit) {
+    panels.push(listPanel('Recent changes', l.recent_audit.length ? `<ul class="audit-list">${l.recent_audit.map((a) => `<li>
+      <div><b>${esc(String(a.action || '').replace(/[._]/g, ' '))}</b> <span class="muted">by ${esc(a.user_name || 'system')} · ${esc(a.created_at)}</span></div>
+      <div class="muted small">${esc(auditDetailText(a.detail))}</div></li>`).join('')}</ul>`
+      : '<p class="muted" style="margin:0">Nothing recorded yet.</p>', '<a class="link" href="#/owner">Audit log</a>'))
+  }
+
+  return `<div class="dash-actions row" role="group" aria-label="Quick actions">${actionHtml}</div>
+    <div class="cards dash-cards">${cards.join('')}</div>
+    <div class="dash-grid">${panels.join('')}</div>`
+}
+
+async function dashboardView(view) {
+  let alive = true
+  let data = null
+  view.innerHTML = `<div class="stack dash">
+    <div class="row dash-head"><div><h1 id="dash-hello"></h1><div class="muted" id="dash-date"></div></div><div class="spacer"></div>
+      <span class="muted small" id="dash-updated" aria-live="polite"></span><button id="dash-refresh">Refresh</button></div>
+    <div id="dash-body"><p class="muted">Loading…</p></div></div>`
+  const body = $('#dash-body', view)
+
+  async function load(quiet) {
+    let d
+    try {
+      d = await get('/dashboard')
+    } catch (e) {
+      if (!alive) return
+      if (!data) body.innerHTML = `<div class="panel"><p class="muted">The dashboard could not load: ${esc(e.message)}</p></div>`
+      $('#dash-updated', view).textContent = 'Could not refresh'
+      if (!quiet) toast(e.message, true)
+      return
+    }
+    if (!alive) return
+    data = d
+    $('#dash-hello', view).textContent = `${greeting()}, ${String(state.user.full_name || '').split(' ')[0]}`
+    $('#dash-date', view).textContent = `${dayLabel(d.date, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} · ${state.user.role}${d.is_owner ? ' · owner' : ''}`
+    body.innerHTML = dashboardHtml(d)
+    bindChart(body)
+    $('#dash-updated', view).textContent = `Updated ${new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`
+  }
+  const refresh = () => load(true)
+
+  $('#dash-refresh', view).addEventListener('click', () => load(false))
+  body.addEventListener('click', (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act
+    if (act === 'open-till') openTillDialog(refresh)
+    if (act === 'close-till') guard(() => closeTillDialog(refresh))()
+    const tr = e.target.closest('tr[data-sale]')
+    if (tr) guard(() => openSale(Number(tr.dataset.sale), refresh))()
+  })
+  body.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('tr[data-sale]')) guard(() => openSale(Number(e.target.dataset.sale), refresh))()
+  })
+
+  // Refresh every minute while the tab is visible, and on coming back to it.
+  const timer = setInterval(() => document.visibilityState === 'visible' && refresh(), DASH_REFRESH_MS)
+  const onVisible = () => document.visibilityState === 'visible' && refresh()
+  document.addEventListener('visibilitychange', onVisible)
+  await load(false)
+  return () => {
+    alive = false
+    clearInterval(timer)
+    document.removeEventListener('visibilitychange', onVisible)
+  }
+}
 
 // ---------- receipt ----------
 
@@ -811,13 +1094,29 @@ const packingText = (p) => ((p.pack_size || 1) > 1 || p.packing ? `${esc(p.packi
 
 async function productsView(view) {
   const editable = can('admin', 'pharmacist')
+  // #/products?unpriced=1 (dashboard alert): active items still without a pack price.
+  const unpriced = editable && hashParam('unpriced') === '1'
+  let pick = null
   view.innerHTML = `<div class="stack">
-    <div class="row"><h1>Products</h1><div class="spacer"></div>
-      <input id="pq" placeholder="Search name, generic or barcode">
-      <label class="row" style="font-size:13px"><input type="checkbox" id="inactive"> Show inactive</label>
+    <div class="row"><h1>${unpriced ? 'Items without a price' : 'Products'}</h1><div class="spacer"></div>
+      <input id="pq" placeholder="Search name, generic or barcode" aria-label="Search products">
+      ${unpriced ? '<a class="link" href="#/products">Show all products</a>' : '<label class="row" style="font-size:13px"><input type="checkbox" id="inactive"> Show inactive</label>'}
       ${editable ? '<button id="import">Import items</button><button class="primary" id="add">Add product</button>' : ''}</div>
+    ${unpriced ? '<div class="alert">These active items have a pack price of Rs 0, so they would sell for nothing. Click an item to set its pack price; it leaves this list once priced.</div>' : ''}
     <div class="panel table-wrap" id="list"></div></div>`
+  const loadUnpriced = async () => {
+    if (!pick) pick = (await get('/products/pick')).filter((p) => !(p.pack_price > 0))
+    const term = $('#pq', view).value.trim().toLowerCase()
+    const rows = term ? pick.filter((p) => [p.name, p.barcode].some((v) => String(v || '').toLowerCase().includes(term))) : pick
+    $('#list', view).innerHTML = pick.length === 0 ? '<p class="muted">Every active item has a price.</p>' : `
+      <p class="muted" style="font-size:13px;margin-top:0">${pick.length.toLocaleString('en-PK')} item${pick.length === 1 ? '' : 's'} without a price${rows.length > 500 ? ' · showing the first 500, search to find others' : ''}</p>
+      ${rows.length === 0 ? '<p class="muted">No match.</p>' : `<table><thead><tr><th>Name</th><th>Barcode</th><th>Packing</th><th class="num">Pack price</th></tr></thead>
+      <tbody>${rows.slice(0, 500).map((p) => `<tr class="clickable" data-id="${esc(p.id)}" tabindex="0">
+        <td>${esc(productLabel(p))}</td><td>${esc(p.barcode || '')}</td><td>${packingText(p)}</td>
+        <td class="num"><span class="badge expired">No price</span></td></tr>`).join('')}</tbody></table>`}`
+  }
   const load = async () => {
+    if (unpriced) return loadUnpriced()
     const qv = encodeURIComponent($('#pq', view).value.trim())
     const rows = await get(`/products?q=${qv}&limit=500${$('#inactive', view).checked ? '&all=1' : ''}`)
     const more = rows.length === 500 ? '<p class="muted" style="font-size:13px">Showing the first 500 items. Search to find others.</p>' : ''
@@ -831,15 +1130,22 @@ async function productsView(view) {
         <td class="num">${esc(packsText(p.stock, p.pack_size))}${p.reorder_level && p.stock <= p.reorder_level ? ' <span class="badge near">Low</span>' : ''}</td>
         <td>${esc(p.next_expiry || '')}</td></tr>`).join('')}</tbody></table>`
   }
+  const reload = () => {
+    pick = null
+    return load()
+  }
   let t
   $('#pq', view).addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => load().catch((e) => toast(e.message, true)), 200) })
-  $('#inactive', view).addEventListener('change', guard(load))
-  $('#add', view)?.addEventListener('click', () => productForm(null, load))
-  $('#import', view)?.addEventListener('click', () => importDialog(load))
-  $('#list', view).addEventListener('click', guard(async (e) => {
-    const tr = e.target.closest('tr[data-id]')
-    if (tr && editable) productForm(await get(`/products/${tr.dataset.id}`), load)
-  }))
+  $('#inactive', view)?.addEventListener('change', guard(load))
+  $('#add', view)?.addEventListener('click', () => productForm(null, reload))
+  $('#import', view)?.addEventListener('click', () => importDialog(reload))
+  const openRow = guard(async (tr) => {
+    if (tr && editable) productForm(await get(`/products/${tr.dataset.id}`), reload)
+  })
+  $('#list', view).addEventListener('click', (e) => openRow(e.target.closest('tr[data-id]')))
+  $('#list', view).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('tr[data-id]')) openRow(e.target)
+  })
   await load()
 }
 
@@ -1018,12 +1324,12 @@ const importResultHtml = (r) => `<div class="panel">
 
 async function stockView(view) {
   const editable = can('admin', 'pharmacist')
-  let status = 'all'
+  let status = ['near', 'expired'].includes(hashParam('s')) ? hashParam('s') : 'all'
+  const tabs = [['all', 'All batches'], ['near', 'Expiring soon'], ['expired', 'Expired'], ...(editable ? [['moves', 'Stock movements']] : [])]
   view.innerHTML = `<div class="stack">
     <div class="row"><h1>Stock & expiry</h1></div>
     <div class="tabs" id="tabs">
-      <button data-s="all" class="sel">All batches</button><button data-s="near">Expiring soon</button><button data-s="expired">Expired</button>
-      ${editable ? '<button data-s="moves">Stock movements</button>' : ''}
+      ${tabs.map(([k, l]) => `<button data-s="${k}" class="${k === status ? 'sel' : ''}">${l}</button>`).join('')}
     </div>
     <div class="panel table-wrap" id="list"></div></div>`
 
@@ -1098,6 +1404,11 @@ async function purchasesView(view) {
     if (tr) purchaseDetail(await get(`/purchases/${tr.dataset.id}`))
   }))
   await load()
+  // #/purchases?new=1 (dashboard "Receive stock") opens the form straight away.
+  if (hashParam('new')) {
+    history.replaceState(null, '', '#/purchases')
+    guard(() => purchaseForm(load))()
+  }
 }
 
 function purchaseDetail(p) {
@@ -1493,14 +1804,15 @@ function ledgerTableHtml(ledger) {
 // ---------- reports ----------
 
 async function reportsView(view) {
-  const f = { from: today(), to: today(), tab: 'summary' }
+  const REPORT_TABS = [['summary', 'Sales summary'], ['top', 'Top products'], ['low', 'Low stock'], ['expiry', 'Expiry'], ['valuation', 'Stock value'], ['controlled', 'Controlled drug register'], ['dues', 'Supplier dues'], ['deptusage', 'Department usage']]
+  const startTab = hashParam('tab')
+  const f = { from: today(), to: today(), tab: REPORT_TABS.some(([k]) => k === startTab) ? startTab : 'summary' }
   view.innerHTML = `<div class="stack">
     <div class="row"><h1>Reports</h1><div class="spacer"></div>
       <input type="date" id="from" value="${f.from}" aria-label="From"> – <input type="date" id="to" value="${f.to}" aria-label="To">
       <button id="print">Print</button></div>
     <div class="tabs" id="tabs">
-      ${[['summary', 'Sales summary'], ['top', 'Top products'], ['low', 'Low stock'], ['expiry', 'Expiry'], ['valuation', 'Stock value'], ['controlled', 'Controlled drug register'], ['dues', 'Supplier dues'], ['deptusage', 'Department usage']]
-        .map(([k, l]) => `<button data-t="${k}" class="${k === f.tab ? 'sel' : ''}">${l}</button>`).join('')}
+      ${REPORT_TABS.map(([k, l]) => `<button data-t="${k}" class="${k === f.tab ? 'sel' : ''}">${l}</button>`).join('')}
     </div>
     <div id="out"></div></div>`
   const out = $('#out', view)
@@ -2520,7 +2832,8 @@ async function issuesView(view) {
     if (b) await showTab(b.dataset.t)
   }))
   await loadDepartments()
-  await showTab('issue')
+  const startTab = hashParam('tab')
+  await showTab(TABS.some(([k]) => k === startTab) ? startTab : 'issue')
 }
 
 // Department usage report: per department, then per product for one department.
