@@ -4,6 +4,11 @@
   "version": "1.0.0",
   "description": "Pharmacy POS desktop app: the counter, stock and reports in their own window, with direct receipt printing",
   "author": "Syed Ammar Ahmed",
+  "homepage": "https://pharmacy.z88.tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AmmarSAA/Pharmacy-POS"
+  },
   "license": "UNLICENSED",
   "private": true,
   "main": "main.js",
@@ -18,9 +23,28 @@
     "appId": "tech.z88.pharmacy",
     "productName": "Pharmacy POS",
     "artifactName": "Pharmacy-POS-${version}-${os}-${arch}.${ext}",
-    "directories": { "output": "dist", "buildResources": "build" },
-    "files": ["main.js", "preload.js", "offline.html", "build/icon.png", "package.json"],
-    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "icon": "build/icon.png" },
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "offline.html",
+      "build/icon.png",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
@@ -30,7 +54,14 @@
       "shortcutName": "Pharmacy POS"
     },
     "mac": {
-      "target": [{ "target": "dmg", "arch": ["universal"] }],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
       "category": "public.app-category.business",
       "icon": "build/icon.png",
       "extendInfo": {
@@ -38,7 +69,15 @@
         "NSCameraUsageDescription": "Pharmacy POS uses the camera to scan barcodes."
       }
     },
-    "linux": { "target": ["AppImage", "deb"], "category": "Office", "icon": "build/icon.png", "maintainer": "Syed Ammar Ahmed" }
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Office",
+      "icon": "build/icon.png",
+      "maintainer": "Syed Ammar Ahmed"
+    }
   },
   "devDependencies": {
     "electron": "^44.5.0",
