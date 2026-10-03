@@ -152,3 +152,17 @@ The Cloudflare free plan's daily read limit on Durable Object storage stopped th
   Object, unused).
 - Tests: 86 on Node against a throwaway MongoDB replica set; workflow and API suites and the browser
   check (all roles, assistant with Groq) on the Cloudflare runtime against MongoDB.
+
+## Round 5 (apps and offline selling)
+
+- Installable web app (PWA): manifest, icons, service worker (network first, cached app shell).
+- Offline selling: the POS keeps a copy of the catalogue on the device, sells without internet and syncs
+  afterwards. The server (`POST /api/sales` with `offline_id` and `offline_at`) records each sale once, dated when
+  it happened, in the till open at that time. Controlled drugs need the connection; refused sales are listed
+  for review in the side bar.
+- Camera barcode scanning in the POS where the browser can read barcodes (Android).
+- `desktop/`: Electron app for Windows and Linux with direct receipt printing (File → Receipt printer…).
+- `mobile/`: Capacitor Android app with camera and microphone permissions.
+- `.github/workflows/apps.yml` builds the installers and the APK; a manual run with a version publishes a release.
+- Tests: 90 on Node, including offline sync (idempotent, dated, till at the time, refusals); a browser test cut
+  the network, reloaded, sold offline and checked the sale synced once with the right stock.
