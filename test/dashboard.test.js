@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 import { today } from '../src/db.js'
 import { addDays } from '../src/lib/supplier-ledger.js'
@@ -12,12 +12,15 @@ const ids = {}
 const t = today()
 
 before(async () => {
-  db = openDb(':memory:')
+  db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server?.close())
+after(async () => {
+  server?.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body, as = 'owner') {
   const res = await fetch(base + path, {
@@ -34,13 +37,11 @@ const dash = async (as) => {
 }
 
 const addProduct = (name, packPrice, reorder = 0) =>
-  Number(db.prepare('INSERT INTO products (name, pack_size, pack_price, sale_price, reorder_level) VALUES (?, 10, ?, ?, ?)')
-    .run(name, packPrice, Math.round(packPrice / 10), reorder).lastInsertRowid)
+  put(db, 'products', { name, name_lc: name.toLowerCase(), pack_size: 10, pack_price: packPrice, sale_price: Math.round(packPrice / 10),
+    reorder_level: reorder, schedule: 'otc', gst_rate_bps: 0, allow_loose: 1, active: 1 })
 const addBatch = (productId, no, expiry, qty, packPrice) =>
-  db.prepare(
-    `INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price, qty_on_hand, pack_price, pack_size)
-     VALUES (?, ?, ?, 40, ?, ?, ?, 10)`,
-  ).run(productId, no, expiry, Math.round(packPrice / 10), qty, packPrice)
+  put(db, 'batches', { product_id: productId, batch_no: no, expiry_date: expiry, cost_price: 40, sale_price: Math.round(packPrice / 10),
+    qty_on_hand: qty, pack_price: packPrice, pack_size: 10 })
 const inDays = (n) => addDays(t, n)
 
 test('setup: users, products, stock, sales, supplier', async () => {
@@ -53,16 +54,16 @@ test('setup: users, products, stock, sales, supplier', async () => {
     tokens[u] = (await call('POST', '/auth/login', { username: u, password: 'password1' })).body.token
   }
 
-  ids.a = addProduct('Alpha', 1000, 50)     // low: 30 units in date, reorder 50
-  ids.b = addProduct('Bravo', 2000, 5)      // not low
-  ids.c = addProduct('Charlie', 1500, 3)    // low: no stock at all
-  ids.u1 = addProduct('Unpriced none', 0)   // unpriced, no stock
-  ids.u2 = addProduct('Unpriced stock', 0)  // unpriced, in stock
-  addBatch(ids.a, 'A1', inDays(30), 20, 1000)   // near expiry
-  addBatch(ids.a, 'A2', inDays(200), 10, 1000)
-  addBatch(ids.a, 'AX', inDays(-5), 5, 1000)    // expired
-  addBatch(ids.b, 'B1', inDays(300), 100, 2000)
-  addBatch(ids.u2, 'U1', inDays(400), 10, 0)
+  ids.a = await addProduct('Alpha', 1000, 50)     // low: 30 units in date, reorder 50
+  ids.b = await addProduct('Bravo', 2000, 5)      // not low
+  ids.c = await addProduct('Charlie', 1500, 3)    // low: no stock at all
+  ids.u1 = await addProduct('Unpriced none', 0)   // unpriced, no stock
+  ids.u2 = await addProduct('Unpriced stock', 0)  // unpriced, in stock
+  await addBatch(ids.a, 'A1', inDays(30), 20, 1000)   // near expiry
+  await addBatch(ids.a, 'A2', inDays(200), 10, 1000)
+  await addBatch(ids.a, 'AX', inDays(-5), 5, 1000)    // expired
+  await addBatch(ids.b, 'B1', inDays(300), 100, 2000)
+  await addBatch(ids.u2, 'U1', inDays(400), 10, 0)
 
   // Cashier: till with Rs 500, one cash sale of a pack of Alpha (Rs 10).
   assert.equal((await call('POST', '/tills/open', { opening_cash: 50000 }, 'cash1')).status, 201)
@@ -74,17 +75,17 @@ test('setup: users, products, stock, sales, supplier', async () => {
   assert.equal(s2.status, 201, JSON.stringify(s2.body))
 
   // Earlier days, inserted directly.
-  const old = db.prepare(
-    `INSERT INTO sales (invoice_no, user_id, subtotal, discount, tax, total, payment_method, amount_paid, created_at)
-     VALUES (?, ?, ?, 0, 0, ?, 'cash', ?, ?)`,
-  )
-  old.run('Y-1', ids.cash1, 5000, 5000, 5000, `${inDays(-1)} 10:00:00`)
-  old.run('Y-2', ids.cash2, 7000, 7000, 7000, `${inDays(-1)} 18:30:00`)
-  old.run('D3', ids.cash1, 2000, 2000, 2000, `${inDays(-3)} 09:00:00`)
-  old.run('D9', ids.cash1, 9900, 9900, 9900, `${inDays(-9)} 09:00:00`) // outside the 7-day window
+  const old = (invoice_no, user_id, total, created_at) => put(db, 'sales', {
+    invoice_no, user_id, subtotal: total, discount: 0, tax: 0, round_off: 0, total, payment_method: 'cash', amount_paid: total,
+    change_due: 0, prescription_id: null, till_session_id: null, created_at,
+  })
+  await old('Y-1', ids.cash1, 5000, `${inDays(-1)} 10:00:00`)
+  await old('Y-2', ids.cash2, 7000, `${inDays(-1)} 18:30:00`)
+  await old('D3', ids.cash1, 2000, `${inDays(-3)} 09:00:00`)
+  await old('D9', ids.cash1, 9900, `${inDays(-9)} 09:00:00`) // outside the 7-day window
 
   // Supplier with an overdue opening balance of Rs 1000.
-  db.prepare('INSERT INTO suppliers (name, opening_balance, opening_date, due_days) VALUES (?, ?, ?, 30)').run('Supplier A', 100000, inDays(-60))
+  await put(db, 'suppliers', { name: 'Supplier A', opening_balance: 100000, opening_date: inDays(-60), due_days: 30, active: 1 })
 })
 
 test('cashier gets only own till and sales, no store-wide money', async () => {
@@ -168,7 +169,7 @@ test('owner also gets recent audit entries', async () => {
 })
 
 test('a brand-new day with no data still returns a full shape', async () => {
-  const empty = openDb(':memory:')
+  const empty = await testStore()
   const srv = createApp(empty).listen(0)
   await new Promise((r) => srv.once('listening', r))
   try {

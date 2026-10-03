@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 
 let server, base, db
@@ -8,12 +8,15 @@ const tokens = {}
 const ids = {}
 
 before(async () => {
-  db = openDb(':memory:')
+  db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server.close())
+after(async () => {
+  server.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body, as = 'owner') {
   const res = await fetch(base + path, {
@@ -77,9 +80,9 @@ test('only the owner manages admins; the owner cannot be removed', async () => {
 })
 
 test('discount caps follow the owner setting', async () => {
-  db.exec(`INSERT INTO products (id, name, pack_size, pack_price, sale_price) VALUES (900, 'Cap Test', 1, 1000, 1000);
-           INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price, pack_price, pack_size, qty_on_hand)
-           VALUES (900, 'CT1', '2099-01-01', 500, 1000, 1000, 1, 100);`)
+  await db.col('products').insertOne({ _id: 900, id: 900, name: 'Cap Test', name_lc: 'cap test', pack_size: 1, pack_price: 1000, sale_price: 1000,
+    schedule: 'otc', gst_rate_bps: 0, allow_loose: 1, active: 1 })
+  await put(db, 'batches', { product_id: 900, batch_no: 'CT1', expiry_date: '2099-01-01', cost_price: 500, sale_price: 1000, pack_price: 1000, pack_size: 1, qty_on_hand: 100 })
   tokens.cashier = await login('cash1', 'password1')
   const over = await call('POST', '/sales', { items: [{ product_id: 900, qty: 1, discount_bps: 600 }] }, 'cashier')
   assert.equal(over.status, 403)
@@ -115,5 +118,5 @@ test('ownership can be transferred to an active admin', async () => {
   assert.equal((await call('GET', '/auth/me', null, 'admin2')).body.user.is_owner, 1)
   assert.equal((await call('GET', '/auth/me')).body.user.is_owner, 0)
   assert.equal((await call('GET', '/owner/audit')).status, 403)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_owner = 1').get().n, 1)
+  assert.equal(await db.col('users').countDocuments({ is_owner: 1 }), 1)
 })

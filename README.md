@@ -1,8 +1,8 @@
 # Pharmacy POS
 
 Point-of-sale and inventory software for a retail pharmacy, set up for Pakistan (PKR, GST, PMDC, CNIC).
-One small Node.js server with a built-in SQLite database. It runs on the counter PC, and other tills
-on the shop network open it in a browser. No internet connection or cloud database is needed.
+One small Node.js server with a MongoDB database (MongoDB Atlas online, or a local MongoDB). It runs on
+Cloudflare Workers at pharmacy.z88.tech or on any PC, and tills open it in a browser.
 
 ## Features
 
@@ -53,11 +53,12 @@ on the shop network open it in a browser. No internet connection or cloud databa
 
 ## Running it
 
-Requires Node.js 22.5 or newer (it uses Node's built-in `node:sqlite`, so nothing needs compiling).
+Requires Node.js 22.5 or newer and a MongoDB database that supports transactions (MongoDB Atlas,
+including the free M0 tier, or a local replica set).
 
 ```bash
 npm install
-npm start            # http://localhost:3000
+MONGODB_URI="mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/pharmacy" npm start   # http://localhost:3000
 ```
 
 Open the address in a browser. On first run it asks you to create the owner (admin) account.
@@ -75,7 +76,8 @@ npm run seed
 |-----------------|----------------------|-----------------------------------------------------------|
 | `PORT`          | `3000`               | HTTP port                                                 |
 | `HOST`          | `0.0.0.0`            | Interface to listen on (`127.0.0.1` for this PC only)     |
-| `DB_PATH`       | `data/pharmacy.db`   | SQLite database file                                      |
+| `MONGODB_URI`   | (required)           | MongoDB connection string                                 |
+| `MONGODB_DB`    | from the URI         | Database name (the Worker defaults to `pharmacy`)          |
 | `JWT_SECRET`    | generated and stored in the database | Signing key for sign-in sessions          |
 | `COOKIE_SECURE` | off                  | Set to `1` when serving over HTTPS                        |
 | `SETUP_TOKEN`   | none                 | If set, creating the first admin account requires this token. **Always set it on a public server.** |
@@ -87,12 +89,14 @@ footer are set in the app under **Settings**.
 
 ### Backups
 
-All data is in `data/pharmacy.db` (plus `-wal`/`-shm` files while running). Back it up daily, e.g. copy it
-to a USB drive or cloud folder. For a consistent copy while the app is running:
+All data is in MongoDB. Atlas paid tiers take automatic backups; on the free M0 tier, export regularly:
 
 ```bash
-sqlite3 data/pharmacy.db ".backup 'backup-$(date +%F).db'"
+mongodump --uri "$MONGODB_URI" --out "backup-$(date +%F)"
 ```
+
+Each collection keeps the fields the original SQL tables had (integer `id`, money in paisa,
+local-time `created_at` strings), so exports are easy to read and re-import.
 
 ## Deploying online (pharmacy.z88.tech)
 
@@ -101,16 +105,19 @@ hosts (Netlify Functions, Vercel, Cloudflare Workers) can't keep it. Run exactly
 
 ### Option A: Cloudflare Workers (how pharmacy.z88.tech runs)
 
-`worker/index.js` runs the same Express app inside a single Durable Object, whose built-in SQLite
-storage is the database (`worker/sql-storage-db.js` adapts it to the `node:sqlite` interface the app uses).
-Cloudflare Workers Builds deploys every push to `main` with `npx wrangler deploy`, using `wrangler.jsonc`.
+`worker/index.js` runs the same Express app inside a single Durable Object, which holds the MongoDB
+connection for all requests. Cloudflare Workers Builds deploys every push to `main` with
+`npx wrangler deploy`, using `wrangler.jsonc`.
 
+- `MONGODB_URI` is a Worker secret (Atlas connection string; Atlas network access must allow 0.0.0.0/0,
+  since Workers have no fixed IP): `npx wrangler secret put MONGODB_URI`
+- The Durable Object's own SQLite storage held the data before the move to MongoDB (October 2026); it is
+  left in place, unused
 - `SETUP_TOKEN` is a Worker secret: `npx wrangler secret put SETUP_TOKEN`
 - `GROQ_API_KEY` is a Worker secret for the assistant: `npx wrangler secret put GROQ_API_KEY`
 - `UTC_OFFSET_MINUTES` (default 300 = Pakistan) sets the pharmacy's local time, since Workers run on UTC
-- Local run in the Workers runtime: `npx wrangler dev`, then `TEST_BASE_URL=http://localhost:8787 npm test`
-  runs the API tests against it (on an empty database)
-- Durable Object storage keeps 30 days of point-in-time recovery; still export data regularly
+- Local run in the Workers runtime: `npx wrangler dev --var MONGODB_URI:<uri> --var MONGODB_DB:<empty db>`, then
+  `TEST_BASE_URL=http://localhost:8787 node --test test/workflow.test.js` runs the checks against it
 
 ### Option B: Render (click-through)
 
@@ -151,11 +158,12 @@ Back up the `/data` volume daily. Patient names, CNICs and prescriptions are sto
 
 ```bash
 npm run dev    # restart on file changes
-npm test       # API tests against an in-memory database
+npm test       # API tests; each file starts a throwaway MongoDB (mongodb-memory-server)
 TEST_BASE_URL=http://localhost:8787 node --test test/workflow.test.js   # same checks against a running server
 ```
 
-- `src/` — Express API (`routes/`), database schema (`db.js`), stock/FEFO logic (`lib/stock.js`)
+- `src/` — Express API (`routes/`), MongoDB access and transactions (`store.js`), indexes and settings
+  (`db.js`), stock/FEFO logic (`lib/stock.js`)
 - `public/` — browser app (plain JavaScript, no build step)
 - `test/` — API tests with `node:test`
 

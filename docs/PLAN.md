@@ -136,3 +136,19 @@ should be configurable; department issues needed; MultiTec data to follow.
 - Tests: 83 on Node (including scripted assistant runs); workflow and API suites on the Cloudflare
   runtime; browser check as owner, pharmacist and cashier (desktop and phone width) with live Groq on
   both runtimes: stock question, approval card, Urdu answer, no console errors.
+
+## Round 4 (MongoDB)
+
+The Cloudflare free plan's daily read limit on Durable Object storage stopped the live site (3 October
+2026). The data layer moved to MongoDB Atlas; the Worker, domain and the browser app are unchanged.
+
+- Same records and fields as the SQL tables (integer ids, paisa, local-time strings), so API responses
+  and the browser app did not change. Multi-step writes (sales, purchases, returns, issues, tills, day
+  close, supplier payments) run in MongoDB transactions; unique indexes keep usernames, barcodes,
+  invoice numbers, batch numbers and one open till per user unique.
+- Reports are aggregation pipelines; sale, return and issue lines carry their date so reports filter
+  them directly.
+- Started fresh on MongoDB (owner chose not to copy the Cloudflare data, which stays in the Durable
+  Object, unused).
+- Tests: 86 on Node against a throwaway MongoDB replica set; workflow and API suites and the browser
+  check (all roles, assistant with Groq) on the Cloudflare runtime against MongoDB.

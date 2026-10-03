@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 
 let server, base
@@ -13,12 +13,15 @@ before(async () => {
     base = `${process.env.TEST_BASE_URL}/api`
     return
   }
-  const db = openDb(':memory:')
+  const db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server?.close())
+after(async () => {
+  server?.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body, as = 'admin') {
   const res = await fetch(base + path, {

@@ -1,17 +1,17 @@
 // Model providers for the assistant. Each keeps the conversation in its own native message format
 // (stored as-is, append-only) and exposes the same step() / toolResults() shape to the agent.
-// Only network calls are awaited; everything else is synchronous (Durable Object friendly).
 import { HttpError } from '../lib/http.js'
 import { open } from './secret.js'
+import { getSetting } from '../db.js'
 
 const GROQ = 'https://api.groq.com/openai/v1'
 
 // The saved key row: { sealed, hint, updated_at } in the private `assistant_api_key` setting.
-export function savedKey(db) {
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'assistant_api_key'").get()
-  if (!row?.value) return null
+export async function savedKey(db) {
+  const value = await getSetting(db, 'assistant_api_key')
+  if (!value) return null
   try {
-    const v = JSON.parse(row.value)
+    const v = JSON.parse(value)
     return v?.sealed ? v : null
   } catch {
     return null
@@ -19,10 +19,10 @@ export function savedKey(db) {
 }
 
 // GROQ_API_KEY (a Worker secret, or env var locally) wins; else the key the owner saved.
-export function resolveKey(db) {
+export async function resolveKey(db) {
   if (process.env.GROQ_API_KEY) return { key: process.env.GROQ_API_KEY, source: 'environment' }
-  const saved = savedKey(db)
-  const key = saved && open(db, saved.sealed)
+  const saved = await savedKey(db)
+  const key = saved && (await open(db, saved.sealed))
   return key ? { key, source: 'settings' } : { key: null, source: null }
 }
 
@@ -119,10 +119,10 @@ const fake = {
 export const PROVIDERS = { groq, fake }
 
 // AGENT_PROVIDER forces one (tests use 'fake'); otherwise Groq when a key is available.
-export function activeProvider(db) {
+export async function activeProvider(db) {
   const forced = process.env.AGENT_PROVIDER
   if (forced && PROVIDERS[forced]) return PROVIDERS[forced]
-  return resolveKey(db).key ? groq : null
+  return (await resolveKey(db)).key ? groq : null
 }
 
 // Checks a key with Groq before it is saved (a cheap "list models" call). Tests replace this.
@@ -135,7 +135,7 @@ export const keyCheck = {
 }
 
 // ── Voice: speech-to-text with Groq Whisper (understands Urdu and English) ────
-export const voiceAvailable = (db) => process.env.AGENT_PROVIDER === 'fake' || !!resolveKey(db).key
+export const voiceAvailable = async (db) => process.env.AGENT_PROVIDER === 'fake' || !!(await resolveKey(db)).key
 
 const DEVANAGARI = /[ऀ-ॿ]/
 async function whisper(key, audio, mime, language) {
@@ -160,7 +160,7 @@ async function whisper(key, audio, mime, language) {
 // out in Hindi (Devanagari) script when detected automatically, so that case is redone as Urdu.
 export async function transcribe(db, audio, mime, lang) {
   if (process.env.AGENT_PROVIDER === 'fake') return lang === 'ur' ? 'آج کی سیل کتنی ہے؟' : 'What are today\'s sales?'
-  const { key } = resolveKey(db)
+  const { key } = await resolveKey(db)
   if (!key) throw new HttpError(503, 'Voice input needs a Groq API key')
   let text = await whisper(key, audio, mime, lang === 'ur' ? 'ur' : undefined)
   if (DEVANAGARI.test(text)) text = await whisper(key, audio, mime, 'ur')

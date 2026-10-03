@@ -1,8 +1,9 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
-import { transaction, today, getSettings } from '../db.js'
+import { today, getSettings } from '../db.js'
 import { reqInt, reqString, optString, oneOf, badRequest } from '../lib/http.js'
 import { moveStock } from '../lib/stock.js'
+import { addDays, daysBetween } from '../lib/supplier-ledger.js'
 
 const ADJUST_REASONS = ['adjustment', 'expired', 'damaged']
 
@@ -10,57 +11,43 @@ export default function inventoryRoutes(db) {
   const r = Router()
 
   // ?status=expired|near|low ; ?product_id=
-  r.get('/batches', (req, res) => {
+  r.get('/batches', async (req, res) => {
     const t = today()
-    const nearDays = Number(getSettings(db).near_expiry_days) || 90
-    const where = ['b.qty_on_hand > 0']
-    const params = { today: t, near: `+${nearDays} days` }
-    if (req.query.product_id) {
-      where.push('b.product_id = :pid')
-      params.pid = Number(req.query.product_id)
+    const nearDays = Number((await getSettings(db)).near_expiry_days) || 90
+    const nearLimit = addDays(t, nearDays)
+    const filter = { qty_on_hand: { $gt: 0 } }
+    if (req.query.product_id) filter.product_id = Number(req.query.product_id)
+    if (req.query.status === 'expired') filter.expiry_date = { $lt: t }
+    if (req.query.status === 'near') filter.expiry_date = { $gte: t, $lte: nearLimit }
+    const rows = await db.all('batches', filter, { sort: { expiry_date: 1 } })
+    await db.join(rows, [{ key: 'product_id', from: 'products', fields: { product_name: 'name', generic_name: 'generic_name', schedule: 'schedule' } }])
+    for (const b of rows) {
+      b.expiry_status = b.expiry_date < t ? 'expired' : b.expiry_date <= nearLimit ? 'near' : 'ok'
+      b.days_to_expiry = daysBetween(t, b.expiry_date)
     }
-    if (req.query.status === 'expired') where.push('b.expiry_date < :today')
-    if (req.query.status === 'near') where.push("b.expiry_date >= :today AND b.expiry_date <= date(:today, :near)")
-    res.json(
-      db.prepare(
-        `SELECT b.*, p.name AS product_name, p.generic_name, p.schedule,
-           CASE WHEN b.expiry_date < :today THEN 'expired'
-                WHEN b.expiry_date <= date(:today, :near) THEN 'near' ELSE 'ok' END AS expiry_status,
-           CAST(julianday(b.expiry_date) - julianday(:today) AS INTEGER) AS days_to_expiry
-         FROM batches b JOIN products p ON p.id = b.product_id
-         WHERE ${where.join(' AND ')}
-         ORDER BY b.expiry_date, p.name`,
-      ).all(params),
-    )
+    rows.sort((a, b) => (a.expiry_date < b.expiry_date ? -1 : a.expiry_date > b.expiry_date ? 1 : String(a.product_name).localeCompare(String(b.product_name))))
+    res.json(rows)
   })
 
-  r.get('/movements', requireRole('admin', 'pharmacist'), (req, res) => {
-    const params = []
-    let where = ''
-    if (req.query.product_id) {
-      where = 'WHERE m.product_id = ?'
-      params.push(Number(req.query.product_id))
-    }
-    res.json(
-      db.prepare(
-        `SELECT m.*, p.name AS product_name, b.batch_no, u.full_name AS user_name
-         FROM stock_movements m JOIN products p ON p.id = m.product_id JOIN batches b ON b.id = m.batch_id
-         JOIN users u ON u.id = m.user_id ${where} ORDER BY m.id DESC LIMIT 500`,
-      ).all(...params),
-    )
+  r.get('/movements', requireRole('admin', 'pharmacist'), async (req, res) => {
+    const filter = req.query.product_id ? { product_id: Number(req.query.product_id) } : {}
+    const rows = await db.all('stock_movements', filter, { sort: { id: -1 }, limit: 500 })
+    res.json(await db.join(rows, [
+      { key: 'product_id', from: 'products', fields: { product_name: 'name' } },
+      { key: 'batch_id', from: 'batches', fields: { batch_no: 'batch_no' } },
+      { key: 'user_id', from: 'users', fields: { user_name: 'full_name' } },
+    ]))
   })
 
   // Manual correction: stock count, expired write-off, breakage.
-  r.post('/adjustments', requireRole('admin', 'pharmacist'), (req, res) => {
+  r.post('/adjustments', requireRole('admin', 'pharmacist'), async (req, res) => {
     const batchId = reqInt(req.body, 'batch_id', { min: 1, label: 'Batch' })
     const change = reqInt(req.body, 'change', { label: 'Quantity change' })
     if (change === 0) throw badRequest('Quantity change cannot be zero')
     const reason = oneOf(req.body.reason || 'adjustment', ADJUST_REASONS, 'Reason')
     if (reason !== 'adjustment' && change > 0) throw badRequest('Write-offs must reduce stock')
     const note = reason === 'adjustment' ? reqString(req.body, 'note', 'Note') : optString(req.body, 'note')
-    const balance = transaction(db, () =>
-      moveStock(db, { batchId, change, reason, userId: req.user.id, note }),
-    )
+    const balance = await db.tx(() => moveStock(db, { batchId, change, reason, userId: req.user.id, note }))
     res.status(201).json({ batch_id: batchId, balance })
   })
 

@@ -2,7 +2,7 @@
 // `wrangler dev` server: TEST_BASE_URL=http://localhost:8787 (needs an empty database).
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 
 let server, base, token
@@ -11,11 +11,14 @@ before(async () => {
     base = `${process.env.TEST_BASE_URL}/api`
     return
   }
-  server = createApp(openDb(':memory:')).listen(0)
+  server = createApp(await testStore()).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server?.close())
+after(async () => {
+  server?.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body) {
   const res = await fetch(base + path, {

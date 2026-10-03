@@ -55,7 +55,7 @@ export function inject(app, { method = 'GET', url, body, token }) {
 export function apiAs(app, db, user) {
   const token = signToken(db, user)
   return async (method, path, body) => {
-    const r = await inject(app, { method, url: '/api' + path, body, token })
+    const r = await inject(app, { method, url: '/api' + path, body, token: await token })
     if (r.status >= 400) {
       throw Object.assign(new Error(r.body?.message || `Request failed (${r.status})`), { status: r.status })
     }

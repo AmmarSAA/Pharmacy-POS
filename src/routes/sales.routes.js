@@ -1,6 +1,7 @@
-import { Router } from 'express'
+import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
-import { transaction, today, getSettings } from '../db.js'
+import { today, nowStamp, getSettings } from '../db.js'
+import { escapeRegex } from './products.routes.js'
 import { HttpError, badRequest, notFound, reqInt, optInt, reqString, optString, optDate, oneOf } from '../lib/http.js'
 import { allocateFefo, moveStock } from '../lib/stock.js'
 import { percentOf, inclusiveTax, roundToRupee, packAmount } from '../lib/money.js'
@@ -29,26 +30,18 @@ function readPrescription(body, needsControlled) {
   return out
 }
 
-export function loadSale(db, id) {
-  const sale = db
-    .prepare(
-      `SELECT s.*, u.full_name AS cashier_name FROM sales s JOIN users u ON u.id = s.user_id WHERE s.id = ?`,
-    )
-    .get(id)
+export async function loadSale(db, id) {
+  const sale = await db.get('sales', id)
   if (!sale) return null
-  sale.items = db
-    .prepare(
-      `SELECT si.*, p.name AS product_name, p.strength, p.form, p.schedule, b.batch_no, b.expiry_date
-       FROM sale_items si JOIN products p ON p.id = si.product_id JOIN batches b ON b.id = si.batch_id
-       WHERE si.sale_id = ? ORDER BY si.id`,
-    )
-    .all(id)
-  sale.prescription = sale.prescription_id
-    ? db.prepare('SELECT * FROM prescriptions WHERE id = ?').get(sale.prescription_id)
-    : null
-  sale.returns = db
-    .prepare('SELECT r.*, u.full_name AS user_name FROM returns r JOIN users u ON u.id = r.user_id WHERE sale_id = ? ORDER BY r.id')
-    .all(id)
+  await db.join([sale], [{ key: 'user_id', from: 'users', fields: { cashier_name: 'full_name' } }])
+  sale.items = await db.all('sale_items', { sale_id: sale.id }, { sort: { id: 1 } })
+  await db.join(sale.items, [
+    { key: 'product_id', from: 'products', fields: { product_name: 'name', strength: 'strength', form: 'form', schedule: 'schedule' } },
+    { key: 'batch_id', from: 'batches', fields: { batch_no: 'batch_no', expiry_date: 'expiry_date' } },
+  ])
+  sale.prescription = sale.prescription_id ? await db.get('prescriptions', sale.prescription_id) : null
+  sale.returns = await db.all('returns', { sale_id: sale.id }, { sort: { id: 1 } })
+  await db.join(sale.returns, [{ key: 'user_id', from: 'users', fields: { user_name: 'full_name' } }])
   return sale
 }
 
@@ -58,11 +51,12 @@ export default function saleRoutes(db) {
   // Body: { items: [{ product_id, packs?, loose?, qty?, discount_bps }], payment_method, amount_paid,
   //         customer_name?, customer_phone?, prescription? }
   // Units per line = qty if given, else packs * pack_size + loose.
-  r.post('/', (req, res) => {
+  r.post('/', async (req, res) => {
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('The cart is empty')
     const paymentMethod = oneOf(req.body.payment_method || 'cash', PAYMENT_METHODS, 'Payment method')
-    const maxDiscount = maxDiscountFor(getSettings(db), req.user.role)
+    const settings = await getSettings(db)
+    const maxDiscount = maxDiscountFor(settings, req.user.role)
     const onDate = today()
 
     // Merge duplicate lines for the same product so FEFO allocation sees the full quantity.
@@ -70,7 +64,7 @@ export default function saleRoutes(db) {
     for (const [i, it] of items.entries()) {
       const label = `Item ${i + 1}`
       const productId = reqInt(it, 'product_id', { min: 1, label: `${label}: product` })
-      const p = db.prepare('SELECT * FROM products WHERE id = ?').get(productId)
+      const p = await db.get('products', productId)
       if (!p || !p.active) throw badRequest(`Product ${productId} is not available`)
       const packSize = p.pack_size || 1
       let qty
@@ -103,14 +97,13 @@ export default function saleRoutes(db) {
       throw new HttpError(403, 'Controlled drugs must be dispensed by a pharmacist')
     }
     const prescription = hasRx ? readPrescription(req.body, hasControlled) : null
-    const settings = getSettings(db)
-    const till = tillForCash(db, req.user.id, settings, 'sell')
+    const till = await tillForCash(db, req.user.id, settings, 'sell')
 
-    const sale = transaction(db, () => {
+    const sale = await db.tx(async () => {
       // Allocate stock and price every batch slice.
       const lines = []
       for (const l of products) {
-        const { picks, available, short } = allocateFefo(db, l.product.id, l.qty, onDate)
+        const { picks, available, short } = await allocateFefo(db, l.product.id, l.qty, onDate)
         if (short > 0) {
           throw new HttpError(409, `Not enough stock for ${l.product.name}: ${available} available`)
         }
@@ -142,124 +135,119 @@ export default function saleRoutes(db) {
 
       let prescriptionId = null
       if (prescription) {
-        prescriptionId = Number(
-          db.prepare(
-            `INSERT INTO prescriptions (patient_name, patient_phone, patient_cnic, prescriber_name, prescriber_reg_no, rx_date, notes)
-             VALUES (:patient_name, :patient_phone, :patient_cnic, :prescriber_name, :prescriber_reg_no, :rx_date, :notes)`,
-          ).run(prescription).lastInsertRowid,
-        )
+        prescriptionId = await db.insert('prescriptions', prescription)
       }
 
-      const next = db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS n FROM sales').get().n
-      const invoiceNo = `INV-${String(next).padStart(6, '0')}`
-      const saleId = Number(
-        db.prepare(
-          `INSERT INTO sales (invoice_no, user_id, customer_name, customer_phone, prescription_id, subtotal, discount, tax,
-             round_off, total, payment_method, amount_paid, change_due, till_session_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          invoiceNo, req.user.id,
-          optString(req.body, 'customer_name') || prescription?.patient_name || null,
-          optString(req.body, 'customer_phone') || prescription?.patient_phone || null,
-          prescriptionId, subtotal, discount, tax, roundOff, total, paymentMethod, amountPaid, amountPaid - total,
-          till?.id ?? null,
-        ).lastInsertRowid,
-      )
+      const saleId = await db.nextId('sales')
+      const stamp = nowStamp()
+      await db.col('sales').insertOne({
+        _id: saleId, id: saleId, invoice_no: `INV-${String(saleId).padStart(6, '0')}`, user_id: req.user.id,
+        customer_name: optString(req.body, 'customer_name') || prescription?.patient_name || null,
+        customer_phone: optString(req.body, 'customer_phone') || prescription?.patient_phone || null,
+        prescription_id: prescriptionId, subtotal, discount, tax, round_off: roundOff, total, payment_method: paymentMethod,
+        amount_paid: amountPaid, change_due: amountPaid - total, till_session_id: till?.id ?? null, created_at: stamp,
+        has_controlled: hasControlled ? 1 : 0,
+      })
 
-      const insertItem = db.prepare(
-        `INSERT INTO sale_items (sale_id, product_id, batch_id, qty, unit_price, unit_cost, discount_bps, discount,
-           gst_rate_bps, tax, line_total, pack_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
+      let itemId = await db.reserveIds('sale_items', lines.length)
+      const docs = lines.map((l) => {
+        const id = itemId++
+        return {
+          _id: id, id, sale_id: saleId, product_id: l.product.id, batch_id: l.batch.id, qty: l.qty, unit_price: l.batch.sale_price,
+          unit_cost: l.batch.cost_price, discount_bps: l.discountBps, discount: l.discount, gst_rate_bps: l.product.gst_rate_bps,
+          tax: l.tax, line_total: l.net, returned_qty: 0, pack_size: l.product.pack_size || 1, created_at: stamp,
+        }
+      })
+      await db.col('sale_items').insertMany(docs)
       for (const l of lines) {
-        insertItem.run(saleId, l.product.id, l.batch.id, l.qty, l.batch.sale_price, l.batch.cost_price, l.discountBps,
-          l.discount, l.product.gst_rate_bps, l.tax, l.net, l.product.pack_size || 1)
-        moveStock(db, { batchId: l.batch.id, change: -l.qty, reason: 'sale', refId: saleId, userId: req.user.id })
+        await moveStock(db, { batchId: l.batch.id, change: -l.qty, reason: 'sale', refId: saleId, userId: req.user.id })
       }
       return saleId
     })
 
-    res.status(201).json(loadSale(db, sale))
+    res.status(201).json(await loadSale(db, sale))
   })
 
   // ?from=YYYY-MM-DD&to=YYYY-MM-DD&q=invoice/customer
-  r.get('/', (req, res) => {
+  r.get('/', async (req, res) => {
     const from = req.query.from || today()
     const to = req.query.to || from
-    const params = { from, to }
-    let extra = ''
+    const filter = { created_at: { $gte: from, $lt: `${to}~` } }
     if (req.query.q) {
-      extra = 'AND (s.invoice_no LIKE :q OR s.customer_name LIKE :q OR s.customer_phone LIKE :q)'
-      params.q = `%${String(req.query.q).trim()}%`
+      const q = new RegExp(escapeRegex(String(req.query.q).trim()), 'i')
+      filter.$or = [{ invoice_no: q }, { customer_name: q }, { customer_phone: q }]
     }
     // Cashiers only see their own sales.
-    if (req.user.role === 'cashier') {
-      extra += ' AND s.user_id = :uid'
-      params.uid = req.user.id
-    }
-    res.json(
-      db.prepare(
-        `SELECT s.*, u.full_name AS cashier_name,
-           COALESCE((SELECT SUM(refund_total) FROM returns r WHERE r.sale_id = s.id), 0) AS refunded
-         FROM sales s JOIN users u ON u.id = s.user_id
-         WHERE date(s.created_at) BETWEEN :from AND :to ${extra}
-         ORDER BY s.id DESC LIMIT 500`,
-      ).all(params),
-    )
+    if (req.user.role === 'cashier') filter.user_id = req.user.id
+    const rows = await db.all('sales', filter, { sort: { id: -1 }, limit: 500 })
+    await db.join(rows, [{ key: 'user_id', from: 'users', fields: { cashier_name: 'full_name' } }])
+    const refunds = await db.col('returns').aggregate([
+      { $match: { sale_id: { $in: rows.map((r) => r.id) } } }, { $group: { _id: '$sale_id', v: { $sum: '$refund_total' } } },
+    ]).toArray()
+    const byId = new Map(refunds.map((x) => [x._id, x.v]))
+    for (const row of rows) row.refunded = byId.get(row.id) || 0
+    res.json(rows)
   })
 
-  r.get('/:ref', (req, res) => {
+  r.get('/:ref', async (req, res) => {
     const ref = req.params.ref
     const row = /^\d+$/.test(ref)
       ? { id: Number(ref) }
-      : db.prepare('SELECT id FROM sales WHERE invoice_no = ?').get(ref.toUpperCase())
-    const sale = row && loadSale(db, row.id)
+      : await db.col('sales').findOne({ invoice_no: ref.toUpperCase() }, { projection: { id: 1 } })
+    const sale = row && (await loadSale(db, row.id))
     if (!sale) throw notFound('Sale')
     if (req.user.role === 'cashier' && sale.user_id !== req.user.id) throw notFound('Sale')
     res.json(sale)
   })
 
   // Body: { items: [{ sale_item_id, qty, restock? }], reason }
-  r.post('/:id/returns', requireRole('admin', 'pharmacist'), (req, res) => {
+  r.post('/:id/returns', requireRole('admin', 'pharmacist'), async (req, res) => {
     const saleId = Number(req.params.id)
-    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId)
+    const sale = await db.get('sales', saleId)
     if (!sale) throw notFound('Sale')
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('Choose at least one item to return')
     const reason = reqString(req.body, 'reason', 'Reason')
     // Card/wallet sales go back to the card/wallet when the owner allows it; everything else is cash.
-    const settings = getSettings(db)
+    const settings = await getSettings(db)
     const refundMethod =
       settings.refund_card_sales === 'original' && sale.payment_method !== 'cash' ? sale.payment_method : 'cash'
-    const till = refundMethod === 'cash' ? tillForCash(db, req.user.id, settings, 'refund') : null
+    const till = refundMethod === 'cash' ? await tillForCash(db, req.user.id, settings, 'refund') : null
 
-    transaction(db, () => {
-      const lines = items.map((it, i) => {
-        const si = db.prepare('SELECT * FROM sale_items WHERE id = ? AND sale_id = ?').get(Number(it.sale_item_id), saleId)
+    await db.tx(async () => {
+      const lines = []
+      for (const [i, it] of items.entries()) {
+        const si = await db.col('sale_items').findOne({ _id: Number(it.sale_item_id), sale_id: saleId })
         if (!si) throw badRequest(`Item ${i + 1} is not on this sale`)
         const qty = reqInt(it, 'qty', { min: 1, max: si.qty - si.returned_qty, label: `Item ${i + 1}: return quantity` })
         // Refund at the price actually charged, including the item's share of the discount.
         const amount = Math.round((si.line_total * qty) / si.qty)
         const tax = Math.round((si.tax * qty) / si.qty)
-        const batch = db.prepare('SELECT expiry_date FROM batches WHERE id = ?').get(si.batch_id)
+        const batch = await db.get('batches', si.batch_id)
         const restock = it.restock !== false && batch.expiry_date >= today()
-        return { si, qty, amount, tax, restock }
-      })
+        lines.push({ si, qty, amount, tax, restock })
+      }
       const refundTotal = lines.reduce((s, l) => s + l.amount, 0)
-      const returnId = Number(
-        db.prepare('INSERT INTO returns (sale_id, user_id, reason, refund_total, till_session_id, refund_method) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(saleId, req.user.id, reason, refundTotal, till?.id ?? null, refundMethod).lastInsertRowid,
-      )
+      const returnId = await db.insert('returns', {
+        sale_id: saleId, user_id: req.user.id, reason, refund_total: refundTotal, till_session_id: till?.id ?? null, refund_method: refundMethod,
+      })
       for (const l of lines) {
-        db.prepare('INSERT INTO return_items (return_id, sale_item_id, qty, amount, tax, restocked) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(returnId, l.si.id, l.qty, l.amount, l.tax, l.restock ? 1 : 0)
-        db.prepare('UPDATE sale_items SET returned_qty = returned_qty + ? WHERE id = ?').run(l.qty, l.si.id)
+        await db.insert('return_items', {
+          return_id: returnId, sale_item_id: l.si.id, qty: l.qty, amount: l.amount, tax: l.tax, restocked: l.restock ? 1 : 0,
+          unit_cost: l.si.unit_cost, product_id: l.si.product_id,
+        })
+        // Conditional, so a line can never be returned twice over.
+        const upd = await db.col('sale_items').updateOne(
+          { _id: l.si.id, returned_qty: { $lte: l.si.qty - l.qty } }, { $inc: { returned_qty: l.qty } },
+        )
+        if (!upd.modifiedCount) throw new HttpError(409, 'This item was returned already')
         if (l.restock) {
-          moveStock(db, { batchId: l.si.batch_id, change: l.qty, reason: 'return', refId: returnId, userId: req.user.id })
+          await moveStock(db, { batchId: l.si.batch_id, change: l.qty, reason: 'return', refId: returnId, userId: req.user.id })
         }
       }
       return returnId
     })
-    res.status(201).json(loadSale(db, saleId))
+    res.status(201).json(await loadSale(db, saleId))
   })
 
   return r

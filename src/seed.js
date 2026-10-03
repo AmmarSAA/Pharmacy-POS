@@ -1,16 +1,16 @@
 // Loads demo suppliers, products and stock into an empty database, for trying the app out.
 // Run after creating the admin account: npm run seed
-import { transaction } from './db.js'
-import { openDb } from './db-node.js'
+import { openStore } from './db-node.js'
 import { moveStock } from './lib/stock.js'
+import { today } from './db.js'
 
-const db = openDb()
-const admin = db.prepare("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").get()
+const db = await openStore()
+const admin = await db.col('users').findOne({ role: 'admin' }, { sort: { id: 1 } })
 if (!admin) {
   console.error('Create the admin account first (start the app and open it in a browser), then run the seed.')
   process.exit(1)
 }
-if (db.prepare('SELECT COUNT(*) AS n FROM products').get().n > 0) {
+if ((await db.col('products').countDocuments({})) > 0) {
   console.error('Products already exist; the seed only runs on an empty catalogue.')
   process.exit(1)
 }
@@ -38,35 +38,29 @@ const PRODUCTS = [
   ['Surgical Mask', null, '8964000100134', 'Mask', '3-ply', 50, 'otc', 1800, 100, 1000, 600],
 ]
 
-transaction(db, () => {
-  const supplierId = Number(
-    db.prepare("INSERT INTO suppliers (name, phone, address) VALUES ('City Pharma Distributors', '042-00000000', 'Lahore')")
-      .run().lastInsertRowid,
-  )
-  const purchaseId = Number(
-    db.prepare("INSERT INTO purchases (supplier_id, invoice_no, invoice_date, total, user_id) VALUES (?, 'DEMO-1', date('now'), 0, ?)")
-      .run(supplierId, admin.id).lastInsertRowid,
-  )
+await db.tx(async () => {
+  const supplierId = await db.insert('suppliers', { name: 'City Pharma Distributors', phone: '042-00000000', address: 'Lahore', due_days: 0, opening_balance: 0, active: 1 })
+  const purchaseId = await db.insert('purchases', {
+    supplier_id: supplierId, invoice_no: 'DEMO-1', invoice_date: today(), payment_type: 'credit', due_date: today(), gross: 0, discount: 0, total: 0, user_id: admin.id,
+  })
   let total = 0
-  PRODUCTS.forEach(([name, generic, barcode, form, strength, pack, schedule, gst, reorder, price, cost], i) => {
-    const productId = Number(
-      db.prepare(
-        `INSERT INTO products (name, generic_name, barcode, form, strength, pack_size, schedule, gst_rate_bps, reorder_level, sale_price)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(name, generic, barcode, form, strength, pack, schedule, gst, reorder, price).lastInsertRowid,
-    )
+  for (const [i, [name, generic, barcode, form, strength, pack, schedule, gst, reorder, price, cost]] of PRODUCTS.entries()) {
+    const productId = await db.insert('products', {
+      name, name_lc: name.toLowerCase(), generic_name: generic, barcode, form, strength, pack_size: pack, schedule, gst_rate_bps: gst,
+      reorder_level: reorder, sale_price: price, pack_price: price * pack, allow_loose: 1, active: 1,
+    })
     // Two batches each: one expiring soon, one later, so FEFO and expiry alerts are visible.
     for (const [suffix, months, qty] of [['A', 2 + (i % 3), 40], ['B', 18, 120]]) {
-      const batchId = Number(
-        db.prepare('INSERT INTO batches (product_id, batch_no, expiry_date, cost_price, sale_price) VALUES (?, ?, ?, ?, ?)')
-          .run(productId, `DEMO${i + 1}${suffix}`, inMonths(months), cost, price).lastInsertRowid,
-      )
-      db.prepare('INSERT INTO purchase_items (purchase_id, batch_id, qty, cost_price, line_total) VALUES (?, ?, ?, ?, ?)')
-        .run(purchaseId, batchId, qty, cost, qty * cost)
-      moveStock(db, { batchId, change: qty, reason: 'purchase', refId: purchaseId, userId: admin.id })
+      const batchId = await db.insert('batches', {
+        product_id: productId, batch_no: `DEMO${i + 1}${suffix}`, expiry_date: inMonths(months), cost_price: cost, sale_price: price,
+        pack_price: price * pack, pack_size: pack, qty_on_hand: 0,
+      })
+      await db.insert('purchase_items', { purchase_id: purchaseId, batch_id: batchId, qty, cost_price: cost, line_total: qty * cost })
+      await moveStock(db, { batchId, change: qty, reason: 'purchase', refId: purchaseId, userId: admin.id })
       total += qty * cost
     }
-  })
-  db.prepare('UPDATE purchases SET total = ? WHERE id = ?').run(total, purchaseId)
+  }
+  await db.col('purchases').updateOne({ _id: purchaseId }, { $set: { total, gross: total } })
 })
 console.log(`Seeded ${PRODUCTS.length} products with stock.`)
+await db.client.close()

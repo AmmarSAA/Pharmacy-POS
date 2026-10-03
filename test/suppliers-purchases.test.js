@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { openDb } from '../src/db-node.js'
+import { testStore, stopTestStore, put } from './helpers/mongo.js'
 import { createApp } from '../src/app.js'
 import { today } from '../src/db.js'
 
@@ -11,12 +11,15 @@ const tokens = {}
 const ids = {}
 
 before(async () => {
-  db = openDb(':memory:')
+  db = await testStore()
   server = createApp(db).listen(0)
   await new Promise((r) => server.once('listening', r))
   base = `http://127.0.0.1:${server.address().port}/api`
 })
-after(() => server?.close())
+after(async () => {
+  server?.close()
+  await stopTestStore()
+})
 
 async function call(method, path, body, as = 'admin') {
   const res = await fetch(base + path, {
@@ -103,7 +106,7 @@ test('pack line: packs + loose, bonus, discount, cost incl. bonus, default margi
   assert.equal(it.pack_price, 1059)
   assert.equal(it.sale_price, 106)
 
-  const batch = db.prepare('SELECT * FROM batches WHERE id = ?').get(it.batch_id)
+  const batch = await db.get('batches', it.batch_id)
   assert.equal(batch.pack_price, 1059)
   assert.equal(batch.pack_size, 10)
   assert.equal(batch.cost_price, 75)
@@ -112,7 +115,7 @@ test('pack line: packs + loose, bonus, discount, cost incl. bonus, default margi
   assert.equal(product.pack_price, 1059)
   assert.equal(product.sale_price, 106)
   assert.equal(product.stock, 30)
-  const move = db.prepare("SELECT * FROM stock_movements WHERE batch_id = ? AND reason = 'purchase'").get(it.batch_id)
+  const move = await db.col('stock_movements').findOne({ batch_id: it.batch_id, reason: 'purchase' })
   assert.equal(move.change, 30)
   assert.equal(move.ref_id, p.id)
   assert.match(move.note, /5 bonus/)
@@ -195,7 +198,7 @@ test('purchase validation', async () => {
   await bad({ supplier_id: 9999, items: [line] }, 404)
   // Till payment needs an open till even though the till is not required for sales here.
   await bad({ payment_type: 'cash', payment_method: 'till', items: [line] }, 409, /Open your till/)
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM batches WHERE batch_no = 'V1'").get().n, 0, 'nothing was saved')
+  assert.equal(await db.col('batches').countDocuments({ batch_no: 'V1' }), 0, 'nothing was saved')
 })
 
 test('supplier payments: validation, bank and till', async () => {
@@ -215,14 +218,13 @@ test('supplier payments: validation, bank and till', async () => {
 
   const noTill = await pay({ amount: 2000, method: 'till' })
   assert.equal(noTill.status, 409)
-  const adminId = db.prepare("SELECT id FROM users WHERE username = 'owner'").get().id
-  const tillId = Number(db.prepare('INSERT INTO till_sessions (user_id, business_date, opening_cash) VALUES (?, ?, ?)')
-    .run(adminId, today(), 10000).lastInsertRowid)
+  const adminId = (await db.col('users').findOne({ username: 'owner' })).id
+  const tillId = await put(db, 'till_sessions', { user_id: adminId, business_date: today(), opening_cash: 10000, status: 'open', opened_at: `${today()} 08:00:00` })
   const till = await pay({ amount: 2000, method: 'till', note: 'Part payment' })
   assert.equal(till.status, 201, JSON.stringify(till.body))
   assert.equal(till.body.paid_on, today())
   assert.equal(till.body.till_session_id, tillId)
-  const mv = db.prepare('SELECT * FROM cash_movements WHERE supplier_payment_id = ?').get(till.body.id)
+  const mv = await db.col('cash_movements').findOne({ supplier_payment_id: till.body.id })
   assert.ok(mv, 'cash movement recorded')
   assert.equal(mv.direction, 'out')
   assert.equal(mv.amount, 2000)
@@ -269,10 +271,10 @@ test('dues report ages unpaid bills, oldest settled first', async () => {
     not_due: 5000, d1_30: 0, d31_60: 2250, d61_90: 18000, d90_plus: 0, overdue: 20250, oldest_unpaid_date: d(-100),
   })
   // Owner policy "opening balance due immediately": due on its own date, 100 days ago.
-  db.prepare("UPDATE settings SET value = 'immediate' WHERE key = 'opening_balance_due'").run()
+  await db.col('settings').updateOne({ _id: 'opening_balance_due' }, { $set: { value: 'immediate' } })
   const immediate = (await call('GET', '/reports/supplier-dues')).body.find((r) => r.supplier_id === ids.s1)
   assert.deepEqual([immediate.d61_90, immediate.d90_plus], [0, 18000])
-  db.prepare("UPDATE settings SET value = 'terms' WHERE key = 'opening_balance_due'").run()
+  await db.col('settings').updateOne({ _id: 'opening_balance_due' }, { $set: { value: 'terms' } })
   const s2 = rows.find((r) => r.supplier_id === ids.s2)
   assert.equal(s2.balance, 0)
   assert.equal(s2.overdue, 0)
