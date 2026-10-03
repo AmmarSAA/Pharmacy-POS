@@ -1,6 +1,7 @@
 // Pharmacy POS front end. Plain ES modules, no build step.
 // Money from the API is integer paisa; everything shown to people is rupees.
 import { mountAssistant, assistantOwnerSection } from './assistant.js'
+import { icon } from './icons.js'
 
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
@@ -359,7 +360,7 @@ function statCard(label, value, sub = '', href = '') {
 function deltaText(now, before) {
   if (!before) return now ? 'Yesterday: Rs 0.00' : 'No sales yesterday either'
   const p = Math.round(((now - before) / before) * 100)
-  const arrow = p > 0 ? '▲' : p < 0 ? '▼' : '='
+  const arrow = p > 0 ? icon('arrow-up', { size: 13 }) : p < 0 ? icon('arrow-down', { size: 13 }) : icon('minus', { size: 13 })
   return `<span class="delta ${p < 0 ? 'down' : p > 0 ? 'up' : ''}">${arrow} ${Math.abs(p)}%</span> vs yesterday (${rs(before)})`
 }
 
@@ -419,7 +420,7 @@ function alertsHtml(a, openReq) {
   const rows = []
   const row = (n, level, title, hint, href) => rows.push(`<a class="alert-row ${n ? level : 'clear'}" href="${esc(href)}">
     <span class="count">${esc(Number(n).toLocaleString('en-PK'))}</span><span class="what"><b>${esc(title)}</b><span class="muted">${esc(hint)}</span></span>
-    <span class="go" aria-hidden="true">›</span></a>`)
+    <span class="go">${icon('chevron-right')}</span></a>`)
   if (a.unpriced_items) {
     row(a.unpriced_items, 'bad', `${a.unpriced_items === 1 ? 'Item' : 'Items'} without a price`,
       `${a.unpriced_in_stock ? `${a.unpriced_in_stock.toLocaleString('en-PK')} in stock. ` : ''}Set pack prices before selling.`, '#/products?unpriced=1')
@@ -801,7 +802,7 @@ function posView(view) {
       <td>${canLoose(p) ? `<input type="number" min="0" max="${ps - 1}" value="${l.loose}" data-loose="${i}" aria-label="Loose units" class="qty">` : '<span class="muted">—</span>'}</td>
       <td><input type="number" min="0" max="${maxDiscount}" step="0.5" value="${l.discount}" data-disc="${i}" aria-label="Discount percent" class="qty"></td>
       <td class="num">${rs(gross - Math.round((gross * l.discount) / 100))}</td>
-      <td><button class="link danger" data-rm="${i}" aria-label="Remove">✕</button></td>
+      <td><button class="link danger" data-rm="${i}" aria-label="Remove">${icon('x')}</button></td>
     </tr>`
   }
 
@@ -931,7 +932,7 @@ function posView(view) {
     let lo = canLoose(line.product) ? Math.max(0, Math.floor(loose) || 0) : 0
     if (ps > 1 && lo >= ps) { p += Math.floor(lo / ps); lo %= ps }
     const units = p * ps + lo
-    if (units < 1) return toast('Quantity must be at least 1 — use ✕ to remove the line', true)
+    if (units < 1) return toast('Quantity must be at least 1 — use the remove button to delete the line', true)
     if (units > line.product.stock) return toast(`Only ${packsText(line.product.stock, ps)} in stock`, true)
     line.packs = p
     line.loose = lo
@@ -1451,7 +1452,7 @@ const purchaseRowHtml = () => `<tr>
   <td><input name="margin" inputmode="decimal" class="w-n" aria-label="Margin percent"></td>
   <td><input name="markup" inputmode="decimal" class="w-n" aria-label="Mark-up percent"></td>
   <td class="num" data-total></td>
-  <td><button type="button" class="link danger" data-rm aria-label="Remove line" tabindex="-1">✕</button></td></tr>`
+  <td><button type="button" class="link danger" data-rm aria-label="Remove line" tabindex="-1">${icon('x')}</button></td></tr>`
 
 // Recomputes one grid row. `source` is the input just edited, so it is not overwritten.
 function calcPurchaseRow(tr, product, source) {
@@ -1752,7 +1753,7 @@ const LEDGER_TYPES = { opening: 'Opening', purchase: 'Purchase', payment: 'Payme
 async function supplierLedgerView(view, id) {
   const f = { from: '', to: today() }
   view.innerHTML = `<div class="stack">
-    <div class="row"><a href="#/suppliers" class="link">← Suppliers</a></div>
+    <div class="row"><a href="#/suppliers" class="link with-icon">${icon('arrow-left')} Suppliers</a></div>
     <div class="row"><h1 id="sname">Supplier</h1><div class="spacer"></div>
       <button id="edit">Edit</button><button id="pay" class="primary">Record payment</button></div>
     <div class="cards" id="scards"></div>
@@ -2256,7 +2257,7 @@ function auditDetailText(detail) {
   return Object.entries(d)
     .map(([k, v]) => {
       const text = v !== null && typeof v === 'object'
-        ? ('from' in v && 'to' in v ? `${v.from} → ${v.to}` : JSON.stringify(v))
+        ? ('from' in v && 'to' in v ? `${v.from} to ${v.to}` : JSON.stringify(v))
         : v
       return `${k.replace(/_/g, ' ')}: ${text}`
     })
@@ -2446,7 +2447,7 @@ function qtyGrid(box, lines, opts = {}) {
               <td><input type="number" min="0" value="${l.packs}" data-packs="${i}" aria-label="Packs" class="qty"></td>
               <td>${canLoose(p) ? `<input type="number" min="0" max="${ps - 1}" value="${l.loose}" data-loose="${i}" aria-label="Loose units" class="qty">` : '<span class="muted">—</span>'}</td>
               <td class="num">${lineUnits(l)}</td>
-              <td><button type="button" class="link danger" data-rm="${i}" aria-label="Remove ${esc(p.name)}">✕</button></td></tr>`
+              <td><button type="button" class="link danger" data-rm="${i}" aria-label="Remove ${esc(p.name)}">${icon('x')}</button></td></tr>`
           }).join('')}</tbody></table></div>`
     opts.onChange?.()
   }
@@ -2456,7 +2457,7 @@ function qtyGrid(box, lines, opts = {}) {
     let lo = canLoose(line.product) ? Math.max(0, Math.floor(loose) || 0) : 0
     if (ps > 1 && lo >= ps) { p += Math.floor(lo / ps); lo %= ps }
     const units = p * ps + lo
-    if (units < 1) return toast('Quantity must be at least 1 — use ✕ to remove the line', true)
+    if (units < 1) return toast('Quantity must be at least 1 — use the remove button to delete the line', true)
     if (opts.checkStock && units > line.product.stock) return toast(`Only ${packsText(line.product.stock, ps)} of ${line.product.name} in stock`, true)
     line.packs = p
     line.loose = lo
@@ -2855,7 +2856,7 @@ async function deptUsageReport(out, f, setTitle) {
       const rows = await get(`/reports/department-usage?${range}&department_id=${dept.id}`)
       setTitle(`Department usage — ${dept.name} ${period}`)
       const sum = (k) => rows.reduce((t, r) => t + (r[k] || 0), 0)
-      out.innerHTML = `<div class="stack"><div class="row"><button class="link" data-back>← All departments</button><h3 style="margin:0">${esc(dept.name)}</h3></div>
+      out.innerHTML = `<div class="stack"><div class="row"><button class="link" data-back>${icon('arrow-left')} All departments</button><h3 style="margin:0">${esc(dept.name)}</h3></div>
         <div class="panel table-wrap"><table>${head(['Product', '#Qty issued', '#Qty returned', '#Net cost'])}
         <tbody>${rows.length ? rows.map((r) => `<tr><td>${esc(r.name)} ${esc(r.strength || '')}</td><td class="num">${r.qty_issued}</td><td class="num">${r.qty_returned || ''}</td><td class="num">${rs(r.net_cost)}</td></tr>`).join('') : '<tr><td colspan="4" class="muted">Nothing issued in this period.</td></tr>'}</tbody>
         <tfoot><tr><td>Total</td><td class="num">${sum('qty_issued')}</td><td class="num">${sum('qty_returned')}</td><td class="num">${rs(sum('net_cost'))}</td></tr></tfoot></table></div></div>`

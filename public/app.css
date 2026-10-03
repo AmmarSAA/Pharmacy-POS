@@ -270,3 +270,8 @@ a.alert-row.clear .count { color: var(--muted); }
   .dash-cards .card .value { font-size: 17px; word-break: break-word; }
   .chart-tip { white-space: normal; max-width: 240px; }
 }
+
+/* Inline SVG icons (public/icons.js) */
+.icon { display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }
+.with-icon, button.link:has(> .icon) { display: inline-flex; align-items: center; gap: 4px; }
+.delta .icon { vertical-align: -0.1em; }

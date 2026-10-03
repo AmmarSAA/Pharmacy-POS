@@ -1,6 +1,7 @@
 // In-app assistant (chat panel). Loaded by app.js.
 // mountAssistant(ctx) is called after sign-in; assistantOwnerSection(el, ctx) inside the Owner panel.
 // ctx = { state, api, get, post, toast, esc, rs, modal, guard } from app.js.
+import { icon } from './icons.js'
 
 const LANG_KEY = 'pos.assistant.lang'
 const MAX_RECORD_MS = 60000
@@ -98,7 +99,7 @@ function createPanel(ctx, status) {
   fab.className = 'as-fab'
   fab.type = 'button'
   fab.setAttribute('aria-label', 'Open assistant')
-  fab.innerHTML = '<span class="as-fab-icon" aria-hidden="true">✦</span><span class="as-fab-label"></span>'
+  fab.innerHTML = `<span class="as-fab-icon">${icon('sparkles', { size: 18 })}</span><span class="as-fab-label"></span>`
 
   const panel = document.createElement('section')
   panel.className = 'as-panel'
@@ -146,7 +147,7 @@ function createPanel(ctx, status) {
     const html = items.map((m) => {
       if (m.type === 'user') return `<div class="as-msg me" dir="auto">${esc(m.text)}</div>`
       if (m.type === 'assistant') return `<div class="as-msg bot" dir="auto">${richText(esc, m.text)}</div>`
-      if (m.type === 'tool') return `<div class="as-tool" dir="auto">🔎 ${esc(m.label || m.name)}</div>`
+      if (m.type === 'tool') return `<div class="as-tool" dir="auto">${icon('search', { size: 13 })} ${esc(m.label || m.name)}</div>`
       if (m.type === 'approval') return cardHtml(m)
       if (m.type === 'error') return `<div class="as-msg err" dir="auto">${esc(m.text || m.message)}</div>`
       return ''
@@ -166,7 +167,7 @@ function createPanel(ctx, status) {
     return `<ul class="as-list">${rows.map((c) => `<li>
       <button type="button" class="link" data-open="${c.id}" dir="auto">${esc(c.title)}</button>
       <span class="muted">${esc(String(c.updated_at || '').slice(0, 16).replace('T', ' '))}</span>
-      <button type="button" class="link danger" data-del="${c.id}" aria-label="${t().del}">✕</button></li>`).join('')}</ul>`
+      <button type="button" class="link danger" data-del="${c.id}" aria-label="${t().del}">${icon('trash', { size: 15 })}</button></li>`).join('')}</ul>`
   }
 
   async function render() {
@@ -183,16 +184,16 @@ function createPanel(ctx, status) {
         <strong>${t().title}</strong>
         <div class="as-head-actions">
           <button type="button" class="as-lang" data-lang="${lang === 'ur' ? 'en' : 'ur'}">${lang === 'ur' ? 'EN' : 'اردو'}</button>
-          <button type="button" class="as-icon" data-act="list" title="${t().history}" aria-label="${t().history}">☰</button>
-          <button type="button" class="as-icon" data-act="new" title="${t().newChat}" aria-label="${t().newChat}">＋</button>
-          <button type="button" class="as-icon" data-act="close" title="${t().close}" aria-label="${t().close}">✕</button>
+          <button type="button" class="as-icon" data-act="list" title="${t().history}" aria-label="${t().history}">${icon('history', { size: 18 })}</button>
+          <button type="button" class="as-icon" data-act="new" title="${t().newChat}" aria-label="${t().newChat}">${icon('plus', { size: 18 })}</button>
+          <button type="button" class="as-icon" data-act="close" title="${t().close}" aria-label="${t().close}">${icon('x', { size: 18 })}</button>
         </div>
       </header>
       <div class="as-body" aria-live="polite">${mode === 'list' ? '<p class="as-note">…</p>' : transcriptHtml()}</div>
       ${note ? `<div class="as-note small" dir="auto">${esc(note)}</div>` : ''}
       <form class="as-compose" id="as-form">
         <textarea id="as-input" rows="1" dir="auto" placeholder="${esc(t().placeholder)}" ${off || awaiting ? 'disabled' : ''}></textarea>
-        ${status.voice ? `<button type="button" class="as-icon as-mic ${recorder ? 'rec' : ''}" data-act="mic" title="${recorder ? t().stop : t().mic}" aria-label="${recorder ? t().stop : t().mic}" ${off || awaiting || busy ? 'disabled' : ''}>🎤</button>` : ''}
+        ${status.voice ? `<button type="button" class="as-icon as-mic ${recorder ? 'rec' : ''}" data-act="mic" title="${recorder ? t().stop : t().mic}" aria-label="${recorder ? t().stop : t().mic}" ${off || awaiting || busy ? 'disabled' : ''}>${icon(recorder ? 'square' : 'mic', { size: 18 })}</button>` : ''}
         <button class="primary" ${off || awaiting || busy ? 'disabled' : ''}>${t().send}</button>
       </form>`
     const body = panel.querySelector('.as-body')

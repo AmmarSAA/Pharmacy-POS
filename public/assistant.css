@@ -7,7 +7,7 @@
   font-weight: 600; box-shadow: 0 4px 16px rgba(0, 0, 0, .18);
 }
 .as-fab:hover { filter: brightness(1.05); }
-.as-fab-icon { font-size: 16px; line-height: 1; }
+.as-fab-icon { display: inline-flex; }
 
 .as-panel {
   position: fixed; right: 20px; bottom: 20px; z-index: 40;
@@ -52,6 +52,7 @@
 .as-msg.err { align-self: stretch; max-width: none; background: var(--danger-soft); color: var(--danger); }
 .as-tool {
   align-self: flex-start; font-size: 12px; color: var(--muted);
+  display: inline-flex; align-items: center; gap: 5px;
   padding: 2px 10px; border: 1px dashed var(--border); border-radius: 999px;
 }
 .as-working { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
