@@ -7,6 +7,7 @@ import { createApp } from '../src/app.js'
 import { initDb, configureClock } from '../src/db.js'
 import { SqlStorageDb } from './sql-storage-db.js'
 import staticFiles from './static-files.gen.js'
+import { runHistory, localNow } from '../src/tools/history.js'
 
 const PORT = 8080
 const INSTANCE_HEADER = 'x-pharmacy-store'
@@ -32,10 +33,32 @@ export class PharmacyStore extends DurableObject {
     configureClock(env.UTC_OFFSET_MINUTES ?? 300)
     this.instanceId = ctx.id.toString()
     const db = initDb(new SqlStorageDb(ctx.storage))
-    apps.set(this.instanceId, createApp(db, { staticFiles }))
+    this.db = db
+    this.app = createApp(db, { staticFiles })
+    apps.set(this.instanceId, this.app)
+  }
+
+  // Temporary: one-off history import, only when the MAINT_TOKEN secret is set and matches.
+  async maintenance(request) {
+    const token = this.env.MAINT_TOKEN
+    const given = request.headers.get('x-maint-token') || ''
+    if (!token || token.length < 32 || given.length !== token.length) return new Response('Not found', { status: 404 })
+    let diff = 0
+    for (let i = 0; i < token.length; i++) diff |= token.charCodeAt(i) ^ given.charCodeAt(i)
+    if (diff !== 0 || request.method !== 'POST') return new Response('Not found', { status: 404 })
+    const body = await request.json()
+    if (body.phase === 'days' && body.to >= localNow(this.db).slice(0, 10)) {
+      return Response.json({ message: 'Only past days can be imported' }, { status: 400 })
+    }
+    try {
+      return Response.json(await runHistory(this.db, this.app, body))
+    } catch (err) {
+      return Response.json({ message: err.message }, { status: 500 })
+    }
   }
 
   fetch(request) {
+    if (new URL(request.url).pathname === '/__maint/history') return this.maintenance(request)
     const headers = new Headers(request.headers)
     headers.set(INSTANCE_HEADER, this.instanceId)
     return handler.fetch(new Request(request, { headers }), this.env, this.ctx)
