@@ -21,26 +21,30 @@ export default function reportRoutes(db) {
   r.get('/summary', async (req, res) => {
     const { from, to } = range(req)
     const when = between(from, to)
-    const s = await one('sales', [{ $match: when }, { $group: {
-      _id: null, invoices: { $sum: 1 }, gross: { $sum: '$subtotal' }, discount: { $sum: '$discount' },
-      tax: { $sum: '$tax' }, round_off: { $sum: '$round_off' }, total: { $sum: '$total' },
-    } }])
+    const [s, costRow, ret, ri, payRows, gstRows, userRows, dayRows] = await Promise.all([
+      one('sales', [{ $match: when }, { $group: {
+        _id: null, invoices: { $sum: 1 }, gross: { $sum: '$subtotal' }, discount: { $sum: '$discount' },
+        tax: { $sum: '$tax' }, round_off: { $sum: '$round_off' }, total: { $sum: '$total' },
+      } }]),
+      one('sale_items', [{ $match: when }, { $group: { _id: null, v: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } }]),
+      one('returns', [{ $match: when }, { $group: { _id: null, count: { $sum: 1 }, total: { $sum: '$refund_total' } } }]),
+      one('return_items', [{ $match: when }, { $group: {
+        _id: null, tax: { $sum: '$tax' }, cost: { $sum: { $multiply: ['$unit_cost', '$qty'] } },
+      } }]),
+      agg('sales', [{ $match: when }, { $group: { _id: '$payment_method', invoices: { $sum: 1 }, total: { $sum: '$total' } } }]),
+      agg('sale_items', [{ $match: when }, { $group: { _id: '$gst_rate_bps', sales: { $sum: '$line_total' }, tax: { $sum: '$tax' } } }, { $sort: { _id: 1 } }]),
+      agg('sales', [{ $match: when }, { $group: { _id: '$user_id', invoices: { $sum: 1 }, total: { $sum: '$total' } } }, { $sort: { total: -1 } }]),
+      agg('sales', [{ $match: when }, { $group: { _id: { $substrBytes: ['$created_at', 0, 10] }, invoices: { $sum: 1 }, total: { $sum: '$total' } } }, { $sort: { _id: 1 } }]),
+    ])
     const sales = { invoices: s.invoices || 0, gross: s.gross || 0, discount: s.discount || 0, tax: s.tax || 0, round_off: s.round_off || 0, total: s.total || 0 }
-    const cost = (await one('sale_items', [{ $match: when }, { $group: { _id: null, v: { $sum: { $multiply: ['$unit_cost', '$qty'] } } } }])).v || 0
-    const ret = await one('returns', [{ $match: when }, { $group: { _id: null, count: { $sum: 1 }, total: { $sum: '$refund_total' } } }])
-    const ri = await one('return_items', [{ $match: when }, { $group: {
-      _id: null, tax: { $sum: '$tax' }, cost: { $sum: { $multiply: ['$unit_cost', '$qty'] } },
-    } }])
+    const cost = costRow.v || 0
     const returns = { count: ret.count || 0, total: ret.total || 0, tax: ri.tax || 0 }
     const returnedCost = ri.cost || 0
-    const byPayment = (await agg('sales', [{ $match: when }, { $group: { _id: '$payment_method', invoices: { $sum: 1 }, total: { $sum: '$total' } } }]))
-      .map((x) => ({ payment_method: x._id, invoices: x.invoices, total: x.total }))
-    const byGstRate = (await agg('sale_items', [{ $match: when }, { $group: { _id: '$gst_rate_bps', sales: { $sum: '$line_total' }, tax: { $sum: '$tax' } } }, { $sort: { _id: 1 } }]))
-      .map((x) => ({ gst_rate_bps: x._id, sales: x.sales, tax: x.tax }))
-    const byUser = await db.join((await agg('sales', [{ $match: when }, { $group: { _id: '$user_id', invoices: { $sum: 1 }, total: { $sum: '$total' } } }, { $sort: { total: -1 } }]))
-      .map((x) => ({ user_id: x._id, invoices: x.invoices, total: x.total })), [{ key: 'user_id', from: 'users', fields: { full_name: 'full_name' } }])
-    const byDay = (await agg('sales', [{ $match: when }, { $group: { _id: { $substrBytes: ['$created_at', 0, 10] }, invoices: { $sum: 1 }, total: { $sum: '$total' } } }, { $sort: { _id: 1 } }]))
-      .map((x) => ({ day: x._id, invoices: x.invoices, total: x.total }))
+    const byPayment = payRows.map((x) => ({ payment_method: x._id, invoices: x.invoices, total: x.total }))
+    const byGstRate = gstRows.map((x) => ({ gst_rate_bps: x._id, sales: x.sales, tax: x.tax }))
+    const byUser = await db.join(userRows.map((x) => ({ user_id: x._id, invoices: x.invoices, total: x.total })),
+      [{ key: 'user_id', from: 'users', fields: { full_name: 'full_name' } }])
+    const byDay = dayRows.map((x) => ({ day: x._id, invoices: x.invoices, total: x.total }))
     const netSales = sales.total - returns.total
     res.json({
       from, to, sales, returns, byPayment, byGstRate,
