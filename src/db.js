@@ -4,7 +4,7 @@
 // This module has no Node-only imports so it also runs on Cloudflare Workers; see db-node.js.
 
 // SQLite modifier that turns UTC 'now' into pharmacy local time.
-const clock = { sqlModifier: 'localtime', offsetMinutes: null, fixed: null }
+const clock = { sqlModifier: 'localtime', offsetMinutes: null }
 
 // On servers whose clock is UTC (e.g. Cloudflare), pin the pharmacy's UTC offset explicitly.
 // Pakistan is UTC+5 with no daylight saving, so a fixed offset is exact.
@@ -16,14 +16,7 @@ export function configureClock(utcOffsetMinutes) {
 }
 
 // SQL expression for the current pharmacy-local timestamp, e.g. SELECT ${sqlNow()} AS t
-export const sqlNow = () => (clock.fixed ? `'${clock.fixed}'` : `datetime('now', '${clock.sqlModifier}')`)
-
-// Pins "now" to a local timestamp 'YYYY-MM-DD HH:MM:SS' (null to release). Used only by the
-// history import (src/tools/history.js), which replays past days through the normal routes.
-export function setFixedClock(stamp) {
-  if (stamp !== null && !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(stamp)) throw new Error('Bad clock stamp')
-  clock.fixed = stamp
-}
+export const sqlNow = () => `datetime('now', '${clock.sqlModifier}')`
 
 const schema = () => `
 CREATE TABLE IF NOT EXISTS settings (
@@ -491,7 +484,6 @@ export function getSettings(db) {
 }
 
 export function today() {
-  if (clock.fixed) return clock.fixed.slice(0, 10)
   if (clock.offsetMinutes !== null) {
     return new Date(Date.now() + clock.offsetMinutes * 60000).toISOString().slice(0, 10)
   }
