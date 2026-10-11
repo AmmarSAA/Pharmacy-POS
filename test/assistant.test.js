@@ -127,6 +127,33 @@ test('a declined action does not run', async () => {
   assert.equal((await call('GET', `/products/${ids.product}`)).body.schedule, 'otc')
 })
 
+test('the assistant makes a demand list only after approval, and can stop suggesting an item', async () => {
+  await call('PUT', `/products/${ids.product}`, { reorder_level: 20 })
+  script = [
+    { calls: [{ name: 'demand_suggestions', input: {} }] },
+    { calls: [{ name: 'create_demand_list', input: { supplier: 'Premier', items: [{ product: 'ph101', packs: 5 }], note: 'Deliver Thursday' } }] },
+    { text: 'Made the demand list.' },
+  ]
+  const r = await converse('/assistant/conversations', { text: 'Make a demand list for Premier' })
+  assert.equal(r.body.status, 'awaiting_approval')
+  assert.ok(r.body.transcript.some((e) => e.type === 'tool' && e.name === 'demand_suggestions'))
+  assert.equal(r.body.pending[0].name, 'create_demand_list')
+  assert.equal((await call('GET', '/demand/lists')).body.length, 0, 'nothing created before approval')
+  await converse(`/assistant/conversations/${r.body.id}/approve`, { decisions: { [r.body.pending[0].id]: true } })
+  const lists = (await call('GET', '/demand/lists')).body
+  assert.equal(lists.length, 1)
+  const l = (await call('GET', `/demand/lists/${lists[0].id}`)).body
+  assert.equal(l.supplier_id, ids.supplier)
+  assert.equal(l.note, 'Deliver Thursday')
+  assert.equal(l.items[0].units, 50)
+
+  script = [{ calls: [{ name: 'mark_not_needed', input: { product: 'ph101', mode: 'never' } }] }, { text: 'It will not be suggested again.' }]
+  const r2 = await converse('/assistant/conversations', { text: 'We do not need Abaktal any more' })
+  await converse(`/assistant/conversations/${r2.body.id}/approve`, { decisions: { [r2.body.pending[0].id]: true } })
+  assert.equal((await call('GET', `/products/${ids.product}`)).body.no_reorder, 1)
+  assert.equal((await call('GET', '/demand/not-needed')).body.length, 1)
+})
+
 test('cashiers are not offered staff tools and cannot use them', async () => {
   script = [{ calls: [{ name: 'record_supplier_payment', input: { supplier: 'Premier', amount: 1000, method: 'cash' } }] }, { text: 'I cannot do that.' }]
   const r = await converse('/assistant/conversations', { text: 'Pay Premier Rs 1000' }, 'cashier')

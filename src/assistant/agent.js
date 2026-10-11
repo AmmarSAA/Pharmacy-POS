@@ -28,6 +28,7 @@ export function systemPrompt(user, settings, lang) {
     '- To make a change, call the action tool directly with complete inputs. The app shows the user a confirmation card and only runs it after they approve, so do not ask "shall I proceed?" first.',
     '- If a required detail is missing (amount, which item, quantity), ask one short question instead of guessing. Do not ask for optional details.',
     '- If the user declines an action, acknowledge it and do not retry unless asked.',
+    '- Demand lists (re-order lists for suppliers): call demand_suggestions first, show what it suggests grouped by supplier, apply any changes the user asks for, then call create_demand_list once per supplier with the exact items. Items with no use in 90 days are listed as idle; leave them out unless the user asks. If the user says an item is not needed any more, use mark_not_needed.',
     '- You cannot make sales, returns, purchases, stock adjustments, deletions or till operations; tell the user which screen to use.',
     '- Do not give medical, dosing or substitution advice beyond what the app data shows; suggest asking the pharmacist or the doctor.',
     '- Keep replies short and practical. Format money like "Rs 1,250". Use short lists for several items.',

@@ -2,6 +2,7 @@ import { Router } from '../lib/router.js'
 import { today, getSettings } from '../db.js'
 import { openTillFor, tillTotals } from '../lib/till.js'
 import { supplierDues, addDays, daysBetween } from '../lib/supplier-ledger.js'
+import { reorderable } from './demand.routes.js'
 
 // Role-based home dashboard. See docs/API-CONTRACT.md (Round 3).
 // cashier: own till and sales only. pharmacist: + store sales, stock alerts, requisitions.
@@ -108,7 +109,7 @@ export default function dashboardRoutes(db) {
         salesByDay(db, addDays(t, -6), t),
         products.countDocuments(unpricedFilter),
         batches.distinct('product_id', { qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t } }),
-        db.all('products', { active: 1, reorder_level: { $gt: 0 } }, {
+        db.all('products', { active: 1, reorder_level: { $gt: 0 }, ...reorderable(t) }, {
           projection: { id: 1, name: 1, strength: 1, form: 1, pack_size: 1, reorder_level: 1 },
         }),
         batches.countDocuments({ qty_on_hand: { $gt: 0 }, expiry_date: { $gte: t, $lte: nearLimit } }),

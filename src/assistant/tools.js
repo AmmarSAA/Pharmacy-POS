@@ -475,7 +475,100 @@ export const TOOLS = [
       return { created: true, request_id: r.id, department: r.department_name, items: r.items.length, status: r.status }
     },
   },
+  {
+    name: 'demand_suggestions', kind: 'read', roles: STAFF, label: 'Worked out what to order',
+    description: 'What to reorder, worked out from real use (sales and ward issues), stock, reorder levels and what is already on open demand lists. Each line has suggested packs, last supplier and last pack cost. "idle" lists low items not sold or issued for 90 days (probably not needed again; not suggested). Use this before create_demand_list.',
+    input_schema: obj({
+      supplier: str('Only items last bought from this supplier (name); "none" for items with no purchase yet'),
+      days: int('Days of use to look at (default 30)'),
+      cover_days: int('How many days the order should last (default 21)'),
+    }),
+    async run(i, { call }) {
+      let supplierId
+      if (i.supplier) supplierId = String(i.supplier).toLowerCase() === 'none' ? 0 : (await findSupplier(call, i.supplier)).id
+      const r = await call('GET', `/demand/suggestions${qs({ days: i.days, cover_days: i.cover_days, supplier_id: supplierId })}`)
+      const line = (s) => ({
+        product: label({ barcode: s.code, name: s.name, strength: s.strength, form: s.form }), stock: packsText(s.stock, s.pack_size),
+        on_order_units: s.on_order || undefined, avg_daily_units: s.daily, days_left: s.days_left,
+        suggested_packs: s.suggested_packs, last_supplier: s.supplier_name, last_pack_cost_rs: rupees(s.last_pack_cost),
+        est_cost_rs: rupees(s.est_cost), reason: s.reason,
+      })
+      return {
+        as_of: r.as_of, use_days: r.days, cover_days: r.cover_days,
+        count: r.suggestions.length,
+        est_total_rs: rupees(r.suggestions.reduce((t, s) => t + (s.est_cost || 0), 0)),
+        suggestions: r.suggestions.slice(0, 60).map(line),
+        idle_not_suggested: r.idle.slice(0, 20).map((s) => ({ product: label({ barcode: s.code, name: s.name, strength: s.strength }), stock: packsText(s.stock, s.pack_size), reason: s.reason })),
+      }
+    },
+  },
+  {
+    name: 'create_demand_list', kind: 'write', roles: STAFF, label: 'Create demand list',
+    description: 'Create a draft demand list (order request) for a supplier, to send for restocking. Give the items and packs (usually from demand_suggestions, adjusted as the user wants). One list per supplier: call this once per supplier. The user can print it or send it on WhatsApp from the Demand screen.',
+    input_schema: obj({
+      supplier: str('Supplier name (optional; leave out if not decided)'),
+      items: {
+        type: 'array', description: 'Medicines to order',
+        items: obj({ product: PRODUCT, packs: int('Full packs'), loose: int('Loose units') }, ['product']),
+      },
+      note: str('Note for the supplier, e.g. "Please deliver by Thursday"'),
+    }, ['items']),
+    async summary(i, ctx) {
+      const { supplier, lines } = await demandLines(i, ctx)
+      const total = lines.reduce((t, l) => t + (l.cost != null ? l.cost : 0), 0)
+      return [
+        ['Supplier', supplier ? supplier.name : 'Not chosen yet'],
+        ...lines.map((l, n) => [`Item ${n + 1}`, `${label(l.p)}: ${packsText(l.units, l.p.pack_size)}${l.cost != null ? ` (about ${fmtRs(l.cost)})` : ''}`]),
+        ['Estimated cost', total ? fmtRs(total) : 'unknown (no earlier purchase)'],
+        ['Note', i.note],
+      ]
+    },
+    async run(i, ctx) {
+      const { supplier, lines } = await demandLines(i, ctx)
+      const r = await ctx.call('POST', '/demand/lists', {
+        supplier_id: supplier?.id, note: i.note,
+        items: lines.map((l) => ({ product_id: l.p.id, packs: Math.floor(l.units / (l.p.pack_size || 1)), loose: l.units % (l.p.pack_size || 1), last_pack_cost: l.lastCost ?? undefined })),
+      })
+      return { created: true, demand_no: r.demand_no, items: r.item_count, supplier: r.supplier_name, est_total_rs: rupees(r.est_total), status: r.status, where: 'Demand screen: print, WhatsApp or mark sent' }
+    },
+  },
+  {
+    name: 'mark_not_needed', kind: 'write', roles: STAFF, label: 'Stop suggesting item',
+    description: 'Stop suggesting a medicine for reorder: mode "never" when it is not needed again (discontinued, no longer prescribed), "snooze" to skip it for some days, "restore" to suggest it again. It also leaves low-stock alerts.',
+    input_schema: obj({ product: PRODUCT, mode: { type: 'string', enum: ['never', 'snooze', 'restore'] }, days: int('For snooze: days to skip (default 30)') }, ['product', 'mode']),
+    async summary(i, { call }) {
+      const p = await findProduct(call, i.product)
+      if (!['never', 'snooze', 'restore'].includes(i.mode)) throw bad('mode must be never, snooze or restore')
+      return [['Medicine', label(p)], ['Change', i.mode === 'never' ? 'Not needed again: never suggest' : i.mode === 'snooze' ? `Skip for ${i.days || 30} days` : 'Suggest again when low'],
+        ['In stock', packsText(p.stock ?? 0, p.pack_size)]]
+    },
+    async run(i, { call }) {
+      const p = await findProduct(call, i.product)
+      const r = await call('POST', '/demand/skip', { product_id: p.id, mode: i.mode, days: i.days })
+      return { done: true, product: p.name, mode: i.mode, skip_until: r.reorder_snooze_until }
+    },
+  },
 ]
+
+async function demandLines(i, { call }) {
+  const supplier = i.supplier ? await findSupplier(call, i.supplier) : null
+  if (!Array.isArray(i.items) || !i.items.length) throw bad('Add at least one item')
+  if (i.items.length > 100) throw bad('At most 100 items per list; split it')
+  const sug = await call('GET', '/demand/suggestions').catch(() => ({ suggestions: [], idle: [] }))
+  const costOf = new Map([...sug.suggestions, ...sug.idle].map((s) => [s.product_id, s.last_pack_cost]))
+  const lines = []
+  for (const it of i.items) {
+    const p = await findProduct(call, it?.product)
+    const packs = Number(it.packs ?? 0)
+    const loose = Number(it.loose ?? 0)
+    if (!Number.isInteger(packs) || !Number.isInteger(loose) || packs < 0 || loose < 0) throw bad(`${p.name}: packs and loose must be whole numbers`)
+    const units = packs * (p.pack_size || 1) + loose
+    if (units < 1) throw bad(`${p.name}: give a quantity in packs`)
+    const lastCost = costOf.get(p.id) ?? null
+    lines.push({ p, units, lastCost, cost: lastCost != null ? Math.round((lastCost * units) / (p.pack_size || 1)) : null })
+  }
+  return { supplier, lines }
+}
 
 async function scheduleTargets(i, { call }) {
   const refs = Array.isArray(i.products) ? i.products.map((x) => String(x ?? '').trim()).filter(Boolean) : []

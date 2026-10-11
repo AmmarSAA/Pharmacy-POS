@@ -62,6 +62,7 @@ const INDEXES = {
   issue_return_items: [[{ issue_return_id: 1 }], [{ issue_item_id: 1 }]],
   assistant_conversations: [[{ user_id: 1, updated_at: -1 }]],
   day_closes: [[{ business_date: 1 }, { unique: true }]],
+  demand_lists: [[{ status: 1, id: -1 }], [{ supplier_id: 1, id: -1 }]],
 }
 
 // Creates indexes and default settings, and makes sure there is an owner. Safe on every start.

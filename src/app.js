@@ -18,6 +18,7 @@ import issueRoutes, { departmentRoutes, issueRequestRoutes } from './routes/issu
 import ownerRoutes from './routes/owner.routes.js'
 import dashboardRoutes from './routes/dashboard.routes.js'
 import assistantRoutes from './routes/assistant.routes.js'
+import demandRoutes from './routes/demand.routes.js'
 
 // publicDir: folder with the browser app on disk (Node).
 // staticFiles: { '/path': { type, body } } used instead when there is no file system (Cloudflare).
@@ -74,6 +75,7 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
   api.use('/owner', ownerRoutes(db))
   api.use('/dashboard', dashboardRoutes(db))
   api.use('/assistant', assistantRoutes(db))
+  api.use('/demand', demandRoutes(db))
   api.use((req, res) => res.status(404).json({ message: 'Not found' }))
   app.use('/api', api)
 

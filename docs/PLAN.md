@@ -166,3 +166,18 @@ The Cloudflare free plan's daily read limit on Durable Object storage stopped th
 - `.github/workflows/apps.yml` builds the installers and the APK; a manual run with a version publishes a release.
 - Tests: 90 on Node, including offline sync (idempotent, dated, till at the time, refusals); a browser test cut
   the network, reloaded, sold offline and checked the sale synced once with the right stock.
+
+## Round 6 (demand lists)
+
+- `src/routes/demand.routes.js`: `GET /api/demand/suggestions` (use over N days, cover days, per supplier),
+  `GET/POST/PUT /api/demand/lists`, `POST /api/demand/lists/:id/status` (draft → sent → received, or cancelled),
+  `POST /api/demand/skip` (never / snooze / restore) and `GET /api/demand/not-needed`. Admin and pharmacist only.
+- A product is suggested when stock that has not expired plus quantity on open lists is at or below
+  max(reorder level, 7 days of use). Order = enough for the cover days, at least twice the reorder level.
+  Items with no use in 90 days are "idle": shown, not suggested.
+- `no_reorder` and `reorder_snooze_until` on products also hide them from the low-stock report and dashboard.
+- Demand list page: suggestions grouped by supplier, editable packs, one list per supplier, print slip,
+  WhatsApp (0300… → 92300…), copy as text, CSV.
+- Assistant tools: `demand_suggestions` (read), `create_demand_list` and `mark_not_needed` (need approval).
+- Fixed: leaving the dashboard before its first load finished showed an error on the next page.
+- Tests: 97 on Node; browser check of suggestions → list → WhatsApp text, not-needed and a manual list.

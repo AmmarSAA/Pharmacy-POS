@@ -2,6 +2,7 @@ import { Router } from '../lib/router.js'
 import { requireRole } from '../auth.js'
 import { today, getSettings } from '../db.js'
 import { supplierDues, addDays, daysBetween } from '../lib/supplier-ledger.js'
+import { reorderable } from './demand.routes.js'
 
 function range(req) {
   const from = req.query.from || today()
@@ -78,7 +79,8 @@ export default function reportRoutes(db) {
   r.get('/low-stock', async (req, res) => {
     const t = today()
     const rows = await agg('products', [
-      { $match: { active: 1, reorder_level: { $gt: 0 } } },
+      // Items marked not needed (or skipped for now) on the Demand screen are left out.
+      { $match: { active: 1, reorder_level: { $gt: 0 }, ...reorderable(t) } },
       { $lookup: {
         from: 'batches', let: { pid: '$id' },
         pipeline: [

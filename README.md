@@ -46,6 +46,18 @@ Cloudflare Workers at pharmacy.z88.tech or on any PC, and tills open it in a bro
   It sees and does only what the signed-in user's role allows; every action is in the audit log
 - The owner switches it on or off and manages the Groq API key in the Owner panel
 
+**Demand lists (re-ordering from suppliers)** (Round 6)
+- The Demand list page suggests what to order, worked out from real use (sales and ward issues over the last
+  30 days, adjustable), stock that has not expired, reorder levels and anything already on an open list.
+  Quantities are in packs and cover 21 days by default; each line shows the last supplier and last cost
+- Medicines nobody buys any more are not ordered again: items with no sales or issues in 90 days are listed
+  separately instead of suggested, and any item can be marked "not needed again" or skipped for 30 days.
+  Both also leave the low-stock alerts; they can be restored under "Not needed"
+- One list per supplier, editable while a draft; print it with a signature line, send it on WhatsApp to the
+  supplier's number, copy it as text or download a CSV; mark it sent, received or cancelled
+- The assistant can do it too: "make a demand list for Premier" → it checks the suggestions and, after you
+  approve, creates the list. It can also mark an item as not needed
+
 **Purchasing, users & reports**
 - Suppliers (with NTN and drug licence number) and stock receiving against supplier invoices, including bonus units
 - Roles: **cashier** (sell, own sales only), **pharmacist** (plus controlled drugs, returns, stock, purchases, reports), **admin** (plus users and settings)

@@ -394,6 +394,7 @@ const ROUTES = [
   { path: 'products', label: 'Products', view: productsView },
   { path: 'stock', label: 'Stock & expiry', view: stockView },
   { path: 'purchases', label: 'Purchases', view: purchasesView, roles: ['admin', 'pharmacist'] },
+  { path: 'demand', label: 'Demand list', view: demandView, roles: ['admin', 'pharmacist'] },
   { path: 'suppliers', label: 'Suppliers', view: suppliersView, roles: ['admin', 'pharmacist'] },
   { path: 'reports', label: 'Reports', view: reportsView, roles: ['admin', 'pharmacist'] },
   { path: 'issues', label: 'Issues', view: issuesView, roles: ['admin', 'pharmacist'] },
@@ -544,7 +545,7 @@ function alertsHtml(a, openReq) {
   }
   if (a.expired) row(a.expired, 'bad', `Expired ${a.expired === 1 ? 'batch' : 'batches'} on hand`, 'Write off or return to supplier.', '#/stock?s=expired')
   row(a.near_expiry, 'warn', `${a.near_expiry === 1 ? 'Batch expires' : 'Batches expire'} within ${a.near_expiry_days} days`, 'Sell first or return to supplier.', '#/stock?s=near')
-  row(a.low_stock, 'warn', 'Low stock', 'At or below the reorder level.', '#/reports?tab=low')
+  row(a.low_stock, 'warn', 'Low stock', 'At or below the reorder level. Make a demand list for suppliers.', can('admin', 'pharmacist') ? '#/demand' : '#/reports?tab=low')
   if (openReq) row(openReq, 'info', `Open ward ${openReq === 1 ? 'requisition' : 'requisitions'}`, 'Waiting to be issued.', '#/issues?tab=requisitions')
   const allClear = !a.unpriced_items && !a.expired && !a.near_expiry && !a.low_stock
   return `<section class="panel"><h2>Alerts</h2>
@@ -690,13 +691,14 @@ async function dashboardView(view) {
     try {
       d = await get('/dashboard')
     } catch (e) {
-      if (!alive) return
+      // Also stop when the user moved to another page while the first load was still running.
+      if (!alive || !body.isConnected) return
       if (!data) body.innerHTML = `<div class="panel"><p class="muted">The dashboard could not load: ${esc(e.message)}</p></div>`
       $('#dash-updated', view).textContent = 'Could not refresh'
       if (!quiet) toast(e.message, true)
       return
     }
-    if (!alive) return
+    if (!alive || !body.isConnected) return
     data = d
     $('#dash-hello', view).textContent = `${greeting()}, ${String(state.user.full_name || '').split(' ')[0]}`
     $('#dash-date', view).textContent = `${dayLabel(d.date, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} · ${state.user.role}${d.is_owner ? ' · owner' : ''}`
@@ -3087,6 +3089,429 @@ async function deptUsageReport(out, f, setTitle) {
     else if (e.target.closest('[data-back]')) show(null).catch((x) => toast(x.message, true))
   }
   await show(null)
+}
+
+// ---------- demand lists (what to order from suppliers) ----------
+
+const DEMAND_BADGE = { draft: 'otc', sent: 'near', received: 'ok', cancelled: 'expired' }
+const demandBadge = (st) => `<span class="badge ${DEMAND_BADGE[st] || 'otc'}">${esc(st)}</span>`
+const demandQty = (i) => {
+  const ps = i.pack_size || 1
+  if (ps <= 1) return `${i.units} unit${i.units === 1 ? '' : 's'}`
+  return `${i.packs} pack${i.packs === 1 ? '' : 's'}${i.loose ? ` + ${i.loose} loose` : ''}`
+}
+const itemName = (i) => [i.name, i.strength, i.form].filter(Boolean).join(' ')
+
+// WhatsApp wants the number in international form without '+': 0300… → 92300…
+const waNumber = (phone) => {
+  let d = String(phone || '').replace(/\D/g, '')
+  if (d.startsWith('00')) d = d.slice(2)
+  if (d.startsWith('0')) d = '92' + d.slice(1)
+  return d.length >= 10 ? d : ''
+}
+
+function demandText(l) {
+  const lines = [
+    `*Demand list ${l.demand_no}*`,
+    state.settings.pharmacy_name,
+    `Date: ${String(l.sent_at || l.created_at).slice(0, 10)}`,
+    ...(l.supplier_name ? [`To: ${l.supplier_name}`] : []),
+    '',
+    ...l.items.map((i, n) => `${n + 1}. ${i.code ? `${i.code} ` : ''}${itemName(i)}${i.packing ? ` (${i.packing})` : ''} — ${demandQty(i)}${i.note ? ` (${i.note})` : ''}`),
+    '',
+    `${l.items.length} item${l.items.length === 1 ? '' : 's'}`,
+    ...(l.note ? [`Note: ${l.note}`] : []),
+    ...(state.settings.phone ? [`Contact: ${state.settings.phone}`] : []),
+  ]
+  return lines.join('\n')
+}
+
+const csvCell = (v) => {
+  const s = String(v ?? '')
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+function downloadFile(name, text, type = 'text/csv') {
+  const url = URL.createObjectURL(new Blob([text], { type: `${type};charset=utf-8` }))
+  const a = Object.assign(document.createElement('a'), { href: url, download: name })
+  document.body.append(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+function demandCsv(l) {
+  const head = ['Code', 'Item', 'Strength', 'Form', 'Pack size', 'Packs', 'Loose', 'Units', 'Last pack cost (Rs)', 'Note']
+  const rows = l.items.map((i) => [i.code, i.name, i.strength, i.form, i.pack_size, i.packs, i.loose, i.units,
+    i.last_pack_cost != null ? toRupees(i.last_pack_cost) : '', i.note])
+  return '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n')
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const ta = Object.assign(document.createElement('textarea'), { value: text })
+    document.body.append(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+  }
+  toast('Copied')
+}
+
+function demandSlipHtml(l) {
+  const s = state.settings
+  return `<div class="issue-slip">
+    <h2>${esc(s.pharmacy_name)}</h2>
+    ${s.address || s.phone ? `<div>${esc([s.address, s.phone].filter(Boolean).join(' · '))}</div>` : ''}
+    ${s.drug_license_no ? `<div>Drug licence: ${esc(s.drug_license_no)}</div>` : ''}
+    <h3 style="margin-top:8px">Demand list — ${esc(l.demand_no)}</h3>
+    <table class="slip-meta">
+      <tr><td>Date</td><td>${esc(String(l.sent_at || l.created_at).slice(0, 10))}</td><td>Supplier</td><td><b>${esc(l.supplier_name || '—')}</b></td></tr>
+      <tr><td>Prepared by</td><td>${esc(l.user_name || '')}</td><td>Contact</td><td>${esc([l.supplier_contact, l.supplier_phone].filter(Boolean).join(' · '))}</td></tr>
+      ${l.note ? `<tr><td>Note</td><td colspan="3">${esc(l.note)}</td></tr>` : ''}
+    </table>
+    <table>
+      <thead><tr><th>#</th><th>Code</th><th>Item</th><th>Packing</th><th class="num">Quantity</th><th>Note</th></tr></thead>
+      <tbody>${l.items.map((i, n) => `<tr><td>${n + 1}</td><td>${esc(i.code || '')}</td><td>${esc(itemName(i))}</td><td>${esc(i.packing || (i.pack_size > 1 ? `${i.pack_size}s` : ''))}</td>
+        <td class="num"><b>${esc(demandQty(i))}</b></td><td>${esc(i.note || '')}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="6">${l.items.length} item${l.items.length === 1 ? '' : 's'}</td></tr></tfoot>
+    </table>
+    <div class="sign-row"><div>Ordered by (pharmacy)</div><div>Received by (supplier)</div></div>
+  </div>`
+}
+
+async function demandView(view) {
+  let tab = ['suggest', 'lists', 'skipped'].includes(hashParam('tab')) ? hashParam('tab') : 'suggest'
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Demand list</h1><div class="spacer"></div><button id="new-list">New empty list</button></div>
+    <p class="muted" style="margin:0">Re-order lists to send to suppliers. Suggestions come from what was actually sold or issued, so medicines nobody buys any more are not ordered again.</p>
+    <div class="tabs" id="tabs">
+      ${[['suggest', 'Suggestions'], ['lists', 'Demand lists'], ['skipped', 'Not needed']].map(([k, l]) => `<button data-t="${k}" class="${k === tab ? 'sel' : ''}">${l}</button>`).join('')}
+    </div>
+    <div id="body"></div></div>`
+  const body = $('#body', view)
+  let suppliers = []
+  const loadSuppliers = async () => { suppliers = (await get('/suppliers')).filter((s) => s.active !== 0) }
+
+  const show = async () => {
+    $$('#tabs button', view).forEach((b) => b.classList.toggle('sel', b.dataset.t === tab))
+    if (tab === 'suggest') await showSuggestions()
+    else if (tab === 'lists') await showLists()
+    else await showSkipped()
+  }
+
+  // --- suggestions ---
+  let days = 30
+  let cover = 21
+  let data = null
+  // product_id → { packs, checked, supplier_id }; kept while the page is open so edits survive a reload.
+  const picks = new Map()
+
+  async function showSuggestions() {
+    body.innerHTML = '<p class="muted">Working out what to order…</p>'
+    await loadSuppliers()
+    data = await get(`/demand/suggestions?days=${days}&cover_days=${cover}`)
+    for (const s of data.suggestions) if (!picks.has(s.product_id)) picks.set(s.product_id, { packs: s.suggested_packs, checked: true, supplier_id: s.supplier_id })
+    renderSuggestions()
+  }
+
+  const groupKey = (sid) => (sid == null ? 'none' : String(sid))
+  function renderSuggestions() {
+    const rows = [...data.suggestions, ...data.idle.filter((r) => picks.get(r.product_id)?.added)]
+    const groups = new Map()
+    for (const r of rows) {
+      const p = picks.get(r.product_id)
+      const k = groupKey(p.supplier_id)
+      if (!groups.has(k)) groups.set(k, [])
+      groups.get(k).push(r)
+    }
+    const supplierName = (k) => (k === 'none' ? 'No supplier yet' : suppliers.find((s) => String(s.id) === k)?.name || rows.find((r) => groupKey(r.supplier_id) === k)?.supplier_name || 'Supplier')
+    const keys = [...groups.keys()].sort((a, b) => (a === 'none') - (b === 'none') || supplierName(a).localeCompare(supplierName(b)))
+    const supplierSel = (r) => `<select data-sup="${r.product_id}" aria-label="Supplier for ${esc(r.name)}"><option value="">No supplier</option>
+      ${suppliers.map((s) => `<option value="${s.id}" ${String(picks.get(r.product_id).supplier_id) === String(s.id) ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>`
+    const rowHtml = (r) => {
+      const p = picks.get(r.product_id)
+      const est = r.last_pack_cost != null ? rs(r.last_pack_cost * p.packs) : '—'
+      return `<tr data-pid="${r.product_id}">
+        <td><input type="checkbox" data-chk ${p.checked ? 'checked' : ''} aria-label="Include ${esc(r.name)}"></td>
+        <td><b>${esc(r.name)}</b> ${esc(r.strength || '')} ${schedBadge(r.schedule || 'otc')}<div class="muted small">${esc(r.code || '')}${r.packing ? ` · ${esc(r.packing)}` : ''} · ${esc(r.reason)}</div></td>
+        <td class="num">${r.stock ? esc(packsText(r.stock, r.pack_size)) : '<span class="badge expired">None</span>'}${r.on_order ? `<div class="muted small">${esc(packsText(r.on_order, r.pack_size))} on order</div>` : ''}</td>
+        <td class="num hide-sm">${r.used ? `${esc(r.daily)}/day` : '—'}${r.days_left != null ? `<div class="muted small">${esc(r.days_left)} days left</div>` : ''}</td>
+        <td class="num"><input type="number" min="0" step="1" data-packs value="${p.packs}" style="width:70px" aria-label="Packs of ${esc(r.name)}">
+          <div class="muted small">${r.pack_size > 1 ? `packs of ${r.pack_size}` : 'units'}</div></td>
+        <td class="num hide-sm">${r.last_pack_cost != null ? rs(r.last_pack_cost) : '—'}</td><td class="num" data-est>${est}</td>
+        <td class="hide-sm">${supplierSel(r)}</td>
+        <td><button class="link" data-skip="never">Not needed again</button><br><button class="link" data-skip="snooze">Skip 30 days</button></td></tr>`
+    }
+    body.innerHTML = `<div class="stack">
+      <div class="panel row" style="flex-wrap:wrap;gap:12px">
+        <label class="field" style="max-width:170px">Look at use over<select id="d-days">${[14, 30, 60, 90].map((n) => `<option value="${n}" ${n === days ? 'selected' : ''}>last ${n} days</option>`).join('')}</select></label>
+        <label class="field" style="max-width:170px">Order enough for<select id="d-cover">${[7, 14, 21, 30, 45, 60].map((n) => `<option value="${n}" ${n === cover ? 'selected' : ''}>${n} days</option>`).join('')}</select></label>
+        <div class="spacer"></div>
+        ${rows.length ? `<button class="primary" id="create-all">${createLabel()}</button>` : ''}
+      </div>
+      ${rows.length ? '' : '<div class="panel"><p class="muted" style="margin:0">Nothing needs ordering right now. Items appear here when stock (plus anything already on an open demand list) runs low for how fast it sells, or falls to the reorder level.</p></div>'}
+      ${keys.map((k) => `<section class="panel"><div class="row"><h2 style="margin:0">${esc(supplierName(k))}</h2>
+          <span class="muted" data-gtotal="${k}">${groupSummary(groups.get(k))}</span><div class="spacer"></div>
+          <button data-create="${k}">Create list</button></div>
+        <div class="table-wrap"><table><thead><tr><th></th><th>Item</th><th class="num">In stock</th><th class="num hide-sm">Use</th><th class="num">Order</th><th class="num hide-sm">Last cost</th><th class="num">Estimate</th><th class="hide-sm">Supplier</th><th></th></tr></thead>
+        <tbody>${groups.get(k).map(rowHtml).join('')}</tbody></table></div></section>`).join('')}
+      ${data.idle.length ? `<details class="panel"><summary><b>Not sold in 90 days (${data.idle.length})</b> <span class="muted">— low on stock, but probably not needed again. Not suggested.</span></summary>
+        <div class="table-wrap"><table><thead><tr><th>Item</th><th class="num">In stock</th><th class="num">Reorder level</th><th>Last supplier</th><th></th></tr></thead>
+        <tbody>${data.idle.map((r) => `<tr data-pid="${r.product_id}"><td>${esc(r.name)} ${esc(r.strength || '')}<div class="muted small">${esc(r.code || '')}</div></td>
+          <td class="num">${esc(packsText(r.stock, r.pack_size))}</td><td class="num">${esc(r.reorder_level)}</td><td>${esc(r.supplier_name || '')}</td>
+          <td>${picks.get(r.product_id)?.added ? '<span class="muted">Added</span>' : '<button class="link" data-add-idle>Order anyway</button>'}<br>
+            <button class="link" data-skip="never">Not needed again</button></td></tr>`).join('')}</tbody></table></div></details>` : ''}
+      <p class="muted small">Suggested quantity covers the chosen days at the current rate of use (at least twice the reorder level), minus stock and anything already on a draft or sent list. Expired stock is not counted.</p>
+    </div>`
+  }
+
+  // Totals and the create button change in place: re-drawing the table while a quantity box is
+  // losing focus would break the click that caused it.
+  const activeRows = () => [...data.suggestions, ...data.idle.filter((r) => picks.get(r.product_id)?.added)]
+  const isPicked = (r) => picks.get(r.product_id)?.checked && picks.get(r.product_id).packs > 0
+  const groupSummary = (list) => {
+    const total = list.reduce((t, r) => t + (r.last_pack_cost != null && isPicked(r) ? r.last_pack_cost * picks.get(r.product_id).packs : 0), 0)
+    return `${plural(list.length, 'item')} · about ${rs(total)}`
+  }
+  const createLabel = () => {
+    const sel = activeRows().filter(isPicked)
+    const n = new Set(sel.map((r) => groupKey(picks.get(r.product_id).supplier_id))).size
+    return `Create ${n > 1 ? `${n} demand lists` : 'demand list'} (${plural(sel.length, 'item')})`
+  }
+  function refreshTotals() {
+    const rows = activeRows()
+    for (const tr of $$('#body section tr[data-pid]', view)) {
+      const r = rows.find((x) => x.product_id === Number(tr.dataset.pid))
+      const est = $('[data-est]', tr)
+      if (r && est) est.textContent = r.last_pack_cost != null ? rs(r.last_pack_cost * picks.get(r.product_id).packs) : '—'
+    }
+    for (const el of $$('[data-gtotal]', view)) el.textContent = groupSummary(rows.filter((r) => groupKey(picks.get(r.product_id).supplier_id) === el.dataset.gtotal))
+    const btn = $('#create-all', view)
+    if (btn) btn.textContent = createLabel()
+  }
+
+  const rowOf = (pid) => [...data.suggestions, ...data.idle].find((r) => r.product_id === pid)
+
+  async function createLists(keys) {
+    const rows = [...data.suggestions, ...data.idle.filter((r) => picks.get(r.product_id)?.added)]
+    const made = []
+    for (const k of keys) {
+      const items = rows.filter((r) => groupKey(picks.get(r.product_id).supplier_id) === k && picks.get(r.product_id).checked && picks.get(r.product_id).packs > 0)
+      if (!items.length) continue
+      const ps = (r) => r.pack_size || 1
+      made.push(await post('/demand/lists', {
+        supplier_id: k === 'none' ? null : Number(k),
+        items: items.map((r) => ({ product_id: r.product_id, packs: ps(r) > 1 ? picks.get(r.product_id).packs : 0, loose: ps(r) > 1 ? 0 : picks.get(r.product_id).packs, last_pack_cost: r.last_pack_cost })),
+      }))
+      for (const r of items) picks.delete(r.product_id)
+    }
+    if (!made.length) return toast('Tick at least one item with a quantity', true)
+    toast(made.length === 1 ? `${made[0].demand_no} created` : `${made.length} demand lists created`)
+    tab = 'lists'
+    await show()
+    if (made.length === 1) openDemandList(made[0].id, show)
+  }
+
+  body.addEventListener('change', guard(async (e) => {
+    if (e.target.id === 'd-days' || e.target.id === 'd-cover') {
+      days = Number($('#d-days', body).value)
+      cover = Number($('#d-cover', body).value)
+      picks.clear()
+      return showSuggestions()
+    }
+    const tr = e.target.closest('tr[data-pid]')
+    if (!tr || !data) return
+    const p = picks.get(Number(tr.dataset.pid))
+    if (!p) return
+    if (e.target.matches('[data-chk]')) p.checked = e.target.checked
+    else if (e.target.matches('[data-packs]')) p.packs = Math.max(0, Math.floor(Number(e.target.value) || 0))
+    else if (e.target.matches('[data-sup]')) {
+      p.supplier_id = e.target.value ? Number(e.target.value) : null
+      return renderSuggestions() // moves the row to that supplier's group
+    }
+    refreshTotals()
+  }))
+  body.addEventListener('click', guard(async (e) => {
+    if (tab !== 'suggest') return
+    const t = e.target
+    if (t.id === 'create-all') {
+      const keys = new Set([...data.suggestions, ...data.idle].filter((r) => picks.get(r.product_id)).map((r) => groupKey(picks.get(r.product_id).supplier_id)))
+      return createLists([...keys])
+    }
+    if (t.dataset.create) return createLists([t.dataset.create])
+    const tr = t.closest('tr[data-pid]')
+    if (!tr) return
+    const pid = Number(tr.dataset.pid)
+    const r = rowOf(pid)
+    if (t.matches('[data-add-idle]')) {
+      picks.set(pid, { packs: Math.max(1, Math.ceil(((r.reorder_level || 1) * 2 - r.stock) / (r.pack_size || 1))), checked: true, supplier_id: r.supplier_id, added: true })
+      return renderSuggestions()
+    }
+    if (t.dataset.skip) {
+      await post('/demand/skip', { product_id: pid, mode: t.dataset.skip, days: 30 })
+      toast(t.dataset.skip === 'never' ? `${r.name} will not be suggested again (restore it under “Not needed”)` : `${r.name} skipped for 30 days`)
+      picks.delete(pid)
+      data.suggestions = data.suggestions.filter((x) => x.product_id !== pid)
+      data.idle = data.idle.filter((x) => x.product_id !== pid)
+      renderSuggestions()
+    }
+  }))
+
+  // --- lists ---
+  let statusFilter = ''
+  async function showLists() {
+    const rows = await get(`/demand/lists${statusFilter ? `?status=${statusFilter}` : ''}`)
+    body.innerHTML = `<div class="stack">
+      <div class="row"><label class="field" style="max-width:200px">Status<select id="l-status">
+        ${[['', 'All'], ['draft', 'Draft'], ['sent', 'Sent'], ['received', 'Received'], ['cancelled', 'Cancelled']].map(([v, l]) => `<option value="${v}" ${v === statusFilter ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+      <div class="panel table-wrap">${rows.length ? `<table><thead><tr><th>No.</th><th>Date</th><th>Supplier</th><th class="num">Items</th><th class="num hide-sm">Estimate</th><th>Status</th><th class="hide-sm">Note</th></tr></thead>
+        <tbody>${rows.map((l) => `<tr class="clickable" data-list="${l.id}"><td>${esc(l.demand_no)}</td><td>${esc(String(l.created_at).slice(0, 16))}</td>
+          <td>${esc(l.supplier_name || '—')}</td><td class="num">${l.item_count}</td><td class="num hide-sm">${l.est_total ? rs(l.est_total) : '—'}</td>
+          <td>${demandBadge(l.status)}</td><td class="hide-sm">${esc(l.note || '')}</td></tr>`).join('')}</tbody></table>`
+        : '<p class="muted" style="margin:0">No demand lists yet. Create one from Suggestions, or ask the assistant: “make a demand list for low stock”.</p>'}</div></div>`
+    $('#l-status', body).addEventListener('change', guard(async (e) => { statusFilter = e.target.value; await showLists() }))
+    body.onclick = (e) => {
+      const tr = e.target.closest('tr[data-list]')
+      if (tr && tab === 'lists') guard(() => openDemandList(Number(tr.dataset.list), show))()
+    }
+  }
+
+  // --- not needed ---
+  async function showSkipped() {
+    const rows = await get('/demand/not-needed')
+    body.innerHTML = `<div class="panel table-wrap">${rows.length ? `<table><thead><tr><th>Item</th><th>Code</th><th>Status</th><th></th></tr></thead>
+      <tbody>${rows.map((p) => `<tr data-pid="${p.id}"><td>${esc(p.name)} ${esc(p.strength || '')}</td><td>${esc(p.barcode || '')}</td>
+        <td>${p.no_reorder ? 'Not needed again' : `Skipped until ${esc(p.reorder_snooze_until)}`}</td><td><button class="link" data-restore>Restore</button></td></tr>`).join('')}</tbody></table>`
+      : '<p class="muted" style="margin:0">Nothing is marked as not needed. Items you mark here are left out of demand suggestions and low-stock alerts.</p>'}</div>`
+    body.onclick = guard(async (e) => {
+      const b = e.target.closest('[data-restore]')
+      if (!b || tab !== 'skipped') return
+      await post('/demand/skip', { product_id: Number(b.closest('tr').dataset.pid), mode: 'restore' })
+      toast('Restored: it will be suggested again when it runs low')
+      await showSkipped()
+    })
+  }
+
+  $('#tabs', view).addEventListener('click', guard(async (e) => {
+    const b = e.target.closest('button[data-t]')
+    if (!b) return
+    tab = b.dataset.t
+    body.onclick = null
+    history.replaceState(null, '', `#/demand?tab=${tab}`)
+    await show()
+  }))
+  $('#new-list', view).addEventListener('click', guard(async () => {
+    await loadSuppliers()
+    editDemandList({ id: null, supplier_id: null, note: '', items: [] }, suppliers, async () => { tab = 'lists'; await show() })
+  }))
+
+  await show()
+  const openId = Number(hashParam('id'))
+  if (openId) guard(() => openDemandList(openId, show))()
+}
+
+async function openDemandList(id, onChange) {
+  const l = await get(`/demand/lists/${id}`)
+  const st = l.status
+  const wa = waNumber(l.supplier_phone)
+  const m = modal(`<div class="row" style="flex-wrap:wrap"><h2 style="margin:0">${esc(l.demand_no)}</h2> ${demandBadge(st)}<div class="spacer"></div>
+      <button id="dl-print" class="primary">Print</button>
+      <button id="dl-wa">WhatsApp${wa ? '' : '…'}</button>
+      <button id="dl-copy">Copy text</button>
+      <button id="dl-csv">${icon('download')} CSV</button></div>
+    ${l.est_total ? `<p class="muted" style="margin:8px 0 0">Estimated cost at last purchase prices: <b>${rs(l.est_total)}</b> (not shown to the supplier)</p>` : ''}
+    <div class="panel" style="margin-top:12px;overflow-x:auto">${demandSlipHtml(l)}</div>
+    <div class="actions" style="flex-wrap:wrap">
+      ${st === 'draft' ? '<button id="dl-edit">Edit</button><button data-st="cancelled">Cancel list</button><button class="primary" data-st="sent">Mark as sent</button>' : ''}
+      ${st === 'sent' ? '<button data-st="draft">Back to draft</button><button data-st="cancelled">Cancel list</button><button class="primary" data-st="received">Mark as received</button>' : ''}
+      ${st === 'cancelled' ? '<button data-st="draft">Reopen as draft</button>' : ''}
+      <button data-close>Close</button></div>`, { wide: true })
+  $('#dl-print', m.el).addEventListener('click', () => printHtml(demandSlipHtml(l), 'report'))
+  $('#dl-copy', m.el).addEventListener('click', guard(() => copyText(demandText(l))))
+  $('#dl-csv', m.el).addEventListener('click', () => downloadFile(`${l.demand_no}${l.supplier_name ? ` ${l.supplier_name}` : ''}.csv`.replace(/[\\/:*?"<>|]/g, ''), demandCsv(l)))
+  $('#dl-wa', m.el).addEventListener('click', guard(async () => {
+    window.open(`https://wa.me/${wa}?text=${encodeURIComponent(demandText(l))}`, '_blank', 'noopener')
+    if (st === 'draft' && confirm('Mark this demand list as sent?')) {
+      await post(`/demand/lists/${l.id}/status`, { status: 'sent' })
+      m.close()
+      toast(`${l.demand_no} marked as sent`)
+      await onChange?.()
+    }
+  }))
+  $('#dl-edit', m.el)?.addEventListener('click', guard(async () => {
+    const suppliers = (await get('/suppliers')).filter((s) => s.active !== 0 || s.id === l.supplier_id)
+    m.close()
+    editDemandList(l, suppliers, onChange)
+  }))
+  $$('[data-st]', m.el).forEach((b) => b.addEventListener('click', guard(async () => {
+    if (b.dataset.st === 'cancelled' && !confirm(`Cancel ${l.demand_no}?`)) return
+    await post(`/demand/lists/${l.id}/status`, { status: b.dataset.st })
+    m.close()
+    toast(`${l.demand_no}: ${b.dataset.st === 'draft' ? 'back to draft' : b.dataset.st}`)
+    await onChange?.()
+  })))
+}
+
+function editDemandList(l, suppliers, onSaved) {
+  const lines = l.items.map((i) => ({ ...i }))
+  const m = modal(`<form id="de"><h2>${l.id ? `Edit ${esc(l.demand_no)}` : 'New demand list'}</h2>
+    <div class="grid">
+      <label class="field">Supplier<select name="supplier_id"><option value="">No supplier yet</option>
+        ${suppliers.map((s) => `<option value="${s.id}" ${s.id === l.supplier_id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select></label>
+      <label class="field">Note for the supplier<input name="note" value="${esc(l.note || '')}" placeholder="e.g. deliver by Thursday"></label>
+    </div>
+    <div id="de-pick" style="margin-top:12px"></div>
+    <div class="table-wrap" style="margin-top:8px"><table><thead><tr><th>Item</th><th class="num">Packs</th><th class="num">Loose</th><th>Note</th><th></th></tr></thead><tbody id="de-lines"></tbody></table></div>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`, { wide: true })
+  const tbody = $('#de-lines', m.el)
+  const render = () => {
+    tbody.innerHTML = lines.length ? lines.map((i, n) => `<tr data-n="${n}"><td>${esc(itemName(i))}<div class="muted small">${esc(i.code || '')}${i.pack_size > 1 ? ` · pack of ${i.pack_size}` : ''}</div></td>
+      <td class="num"><input type="number" min="0" data-f="packs" value="${i.packs}" style="width:70px" ${i.pack_size > 1 ? '' : 'disabled'}></td>
+      <td class="num"><input type="number" min="0" data-f="loose" value="${i.loose}" style="width:70px"></td>
+      <td><input data-f="note" value="${esc(i.note || '')}" placeholder="optional"></td>
+      <td><button type="button" class="link" data-rm aria-label="Remove">${icon('trash')}</button></td></tr>`).join('')
+      : '<tr><td colspan="5" class="muted">Search above to add items.</td></tr>'
+  }
+  itemPicker($('#de-pick', m.el), (p) => {
+    const ps = p.pack_size || 1
+    const have = lines.find((i) => i.product_id === p.id)
+    if (have) {
+      if (ps > 1) have.packs += 1
+      else have.loose += 1
+    } else {
+      lines.push({ product_id: p.id, code: p.barcode, name: p.name, strength: p.strength, form: p.form, pack_size: ps, packs: ps > 1 ? 1 : 0, loose: ps > 1 ? 0 : 1, note: '' })
+    }
+    render()
+  }, 'Search a medicine to add')
+  tbody.addEventListener('input', (e) => {
+    const tr = e.target.closest('tr[data-n]')
+    if (!tr || !e.target.dataset.f) return
+    const i = lines[Number(tr.dataset.n)]
+    i[e.target.dataset.f] = e.target.dataset.f === 'note' ? e.target.value : Math.max(0, Math.floor(Number(e.target.value) || 0))
+  })
+  tbody.addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-n]')
+    if (tr && e.target.closest('[data-rm]')) {
+      lines.splice(Number(tr.dataset.n), 1)
+      render()
+    }
+  })
+  $('#de', m.el).addEventListener('submit', guard(async (ev) => {
+    ev.preventDefault()
+    const f = formData(ev.target)
+    const payload = {
+      supplier_id: f.supplier_id ? Number(f.supplier_id) : null,
+      note: f.note,
+      items: lines.map((i) => ({ product_id: i.product_id, packs: i.packs, loose: i.loose, last_pack_cost: i.last_pack_cost ?? null, note: i.note || null })),
+    }
+    const saved = l.id ? await put(`/demand/lists/${l.id}`, payload) : await post('/demand/lists', payload)
+    m.close()
+    toast(`${saved.demand_no} saved`)
+    await onSaved?.()
+    openDemandList(saved.id, onSaved).catch((e) => toast(e.message, true))
+  }))
+  render()
 }
 
 boot()
