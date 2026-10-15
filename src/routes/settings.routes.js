@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole, PRIVATE_SETTINGS } from '../auth.js'
+import { requirePermission, PRIVATE_SETTINGS } from '../auth.js'
 import { getSettings, setSetting, PROTECTED_SETTINGS } from '../db.js'
 import { HttpError } from '../lib/http.js'
 import { badRequest } from '../lib/http.js'
@@ -18,7 +18,7 @@ export default function settingsRoutes(db) {
 
   r.get('/', async (req, res) => res.json(await publicSettings()))
 
-  r.put('/', requireRole('admin'), async (req, res) => {
+  r.put('/', requirePermission('settings.manage'), async (req, res) => {
     const current = await publicSettings()
     const updates = []
     for (const key of Object.keys(req.body || {})) {

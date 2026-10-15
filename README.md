@@ -9,7 +9,7 @@ Cloudflare Workers at pharmacy.z88.tech or on any PC, and tills open it in a bro
 **Sales & billing**
 - Barcode scanner support (scan → Enter adds the item), or search by brand, generic name or barcode
 - Cart with quantity and per-line discount; discount limits by role (cashier 10%, pharmacist 25%)
-- Cash (with change calculation), card, and JazzCash/Easypaisa payments
+- Cash (with change calculation), card, JazzCash/Easypaisa, or billed to a customer account
 - Bills rounded to the whole rupee (can be switched off)
 - 80 mm thermal receipt with batch and expiry per line, pharmacy licence/NTN/STRN
 - Returns against the original invoice, refunded at the price actually charged; restocks unexpired batches
@@ -60,8 +60,21 @@ Cloudflare Workers at pharmacy.z88.tech or on any PC, and tills open it in a bro
 
 **Purchasing, users & reports**
 - Suppliers (with NTN and drug licence number) and stock receiving against supplier invoices, including bonus units
-- Roles: **cashier** (sell, own sales only), **pharmacist** (plus controlled drugs, returns, stock, purchases, reports), **admin** (plus users and settings)
+- 3 built-in roles — **cashier** (sell, own sales only), **pharmacist** (plus controlled drugs, returns, stock, purchases, reports), **admin** (plus users and settings) — or build a **custom role** from the same permission list (Round 7), e.g. a role that can only manage purchasing
 - Reports: sales summary (net sales, discounts, returns, GST by rate, gross profit, cash in drawer, by staff, by day), top products, low stock/reorder list, expiry, stock valuation at cost and retail
+
+**Purchase orders, customer accounts, stock transfers** (Round 8)
+- Purchase orders: draft → sent → received, received automatically when stock is receipted against one
+- Customer accounts: credit sales ("on account"), a payments ledger mirroring the supplier one, and loyalty points earned on sale and redeemable as a discount
+- Stock transfers to another location: tracked at cost with FEFO, received or reversed
+
+**People, scheduling & collaboration** (Rounds 9-10)
+- Employee records (hire date, salary, CNIC, emergency contact), optionally linked to a login
+- Appointments/shifts — everyone manages their own; a permission unlocks managing everyone's
+- Internal staff messaging, and a knowledge-base wiki for SOPs and references
+
+**Analytics** (Round 11)
+- A dashboard with a sales trend chart, top products, and payment-method split over any date range, alongside the existing text reports
 
 ## Apps (installable, desktop, Android, offline)
 
@@ -200,5 +213,7 @@ TEST_BASE_URL=http://localhost:8787 node --test test/workflow.test.js   # same c
 ## Not included yet
 
 Things a pharmacy may want next: DRAP/FBR POS integration for real-time invoice reporting, selling by
-strip vs. tablet with automatic conversion, customer accounts/credit and loyalty, supplier payments
-and ledgers, purchase orders, stock transfer between branches, and automatic scheduled backups.
+strip vs. tablet with automatic conversion, and automatic scheduled backups. Stock transfers (Round 8)
+track what left this location at cost but don't yet give the destination its own live, sellable
+inventory — a second full location (POS search, FEFO, demand suggestions, reports) would be a bigger,
+separate change.

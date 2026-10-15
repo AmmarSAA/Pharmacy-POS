@@ -6,9 +6,17 @@ import { authenticate } from './auth.js'
 import { Router } from './lib/router.js'
 import authRoutes from './routes/auth.routes.js'
 import userRoutes from './routes/users.routes.js'
+import roleRoutes from './routes/roles.routes.js'
+import employeeRoutes from './routes/employees.routes.js'
+import appointmentRoutes from './routes/appointments.routes.js'
+import messageRoutes from './routes/messages.routes.js'
+import knowledgeRoutes from './routes/knowledge.routes.js'
 import settingsRoutes from './routes/settings.routes.js'
 import productRoutes from './routes/products.routes.js'
 import supplierRoutes from './routes/suppliers.routes.js'
+import customerRoutes from './routes/customers.routes.js'
+import purchaseOrderRoutes from './routes/purchase-orders.routes.js'
+import transferRoutes from './routes/transfers.routes.js'
 import purchaseRoutes from './routes/purchases.routes.js'
 import inventoryRoutes from './routes/inventory.routes.js'
 import saleRoutes from './routes/sales.routes.js'
@@ -61,10 +69,18 @@ export function createApp(db, { publicDir, staticFiles } = {}) {
   api.use('/auth', authRoutes(db))
   api.use(authenticate(db))
   api.use('/users', userRoutes(db))
+  api.use('/roles', roleRoutes(db))
+  api.use('/employees', employeeRoutes(db))
+  api.use('/appointments', appointmentRoutes(db))
+  api.use('/messages', messageRoutes(db))
+  api.use('/knowledge', knowledgeRoutes(db))
   api.use('/settings', settingsRoutes(db))
   api.use('/products', productRoutes(db))
   api.use('/suppliers', supplierRoutes(db))
+  api.use('/customers', customerRoutes(db))
   api.use('/purchases', purchaseRoutes(db))
+  api.use('/purchase-orders', purchaseOrderRoutes(db))
+  api.use('/transfers', transferRoutes(db))
   api.use('/inventory', inventoryRoutes(db))
   api.use('/sales', saleRoutes(db))
   api.use('/reports', reportRoutes(db))

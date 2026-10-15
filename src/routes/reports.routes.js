@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, getSettings } from '../db.js'
 import { supplierDues, addDays, daysBetween } from '../lib/supplier-ledger.js'
 import { reorderable } from './demand.routes.js'
@@ -14,7 +14,7 @@ export const between = (from, to) => ({ created_at: { $gte: from, $lt: `${to}~` 
 
 export default function reportRoutes(db) {
   const r = Router()
-  r.use(requireRole('admin', 'pharmacist'))
+  r.use(requirePermission('reports.view'))
   const agg = (name, pipeline) => db.col(name).aggregate(pipeline).toArray()
   const one = async (name, pipeline) => (await agg(name, pipeline))[0] || {}
 

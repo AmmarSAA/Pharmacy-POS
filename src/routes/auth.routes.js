@@ -2,9 +2,9 @@ import { Router } from '../lib/router.js'
 import bcrypt from 'bcryptjs'
 import rateLimit from 'express-rate-limit'
 import { createHash, timingSafeEqual } from 'node:crypto'
-import { authenticate, signToken, COOKIE } from '../auth.js'
+import { authenticate, signToken, withPermissions, COOKIE } from '../auth.js'
 import { HttpError, reqString } from '../lib/http.js'
-import { setSetting } from '../db.js'
+import { setSetting, systemRoleId } from '../db.js'
 
 const cookieOptions = () => ({
   httpOnly: true,
@@ -59,16 +59,17 @@ export default function authRoutes(db) {
     if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters')
     const pharmacyName = req.body.pharmacy_name?.trim()
     if (pharmacyName) await setSetting(db, 'pharmacy_name', pharmacyName)
+    const roleId = await systemRoleId(db, 'admin')
     // The unique username index makes a second, simultaneous setup fail instead of creating two owners.
     const id = await db.insert('users', {
       username, username_lc: username.toLowerCase(), full_name: fullName, password_hash: bcrypt.hashSync(password, 10),
-      role: 'admin', active: 1, is_owner: 1,
+      role: 'admin', role_id: roleId, active: 1, is_owner: 1,
     })
     if ((await userCount()) > 1) {
       await db.col('users').deleteOne({ _id: id })
       throw new HttpError(409, 'Setup has already been completed')
     }
-    const user = { id, username, full_name: fullName, role: 'admin', is_owner: 1 }
+    const user = await withPermissions(db, { id, username, full_name: fullName, role: 'admin', role_id: roleId, is_owner: 1 })
     res.cookie(COOKIE, await signToken(db, user), cookieOptions()).status(201).json({ user })
   })
 
@@ -80,9 +81,8 @@ export default function authRoutes(db) {
       throw new HttpError(401, 'Incorrect username or password')
     }
     const { password_hash, username_lc, ...safe } = user
-    safe.is_owner = safe.is_owner || 0
     const token = await signToken(db, user)
-    res.cookie(COOKIE, token, cookieOptions()).json({ user: safe, token })
+    res.cookie(COOKIE, token, cookieOptions()).json({ user: await withPermissions(db, safe), token })
   })
 
   r.post('/logout', (req, res) => {

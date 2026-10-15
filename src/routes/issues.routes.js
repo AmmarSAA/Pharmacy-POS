@@ -1,10 +1,10 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, nowStamp } from '../db.js'
 import { HttpError, badRequest, notFound, reqInt, optInt, reqString, optString } from '../lib/http.js'
 import { allocateFefo, moveStock } from '../lib/stock.js'
 
-const staff = requireRole('admin', 'pharmacist')
+const staff = requirePermission('issues.manage')
 const flag = (v, def) => (v === undefined || v === null || v === '' ? def : v === true || v === 1 || v === '1' || v === 'true' ? 1 : 0)
 
 // Units for a line: qty if given, else packs * pack_size + loose (loose needs allow_loose).

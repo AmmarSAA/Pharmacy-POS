@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, getSettings } from '../db.js'
 import { HttpError, badRequest, notFound, reqInt, optInt, reqString, optString, reqDate, optDate, oneOf } from '../lib/http.js'
 import { packAmount, percentOf, priceForMargin } from '../lib/money.js'
@@ -60,7 +60,7 @@ async function readLine(db, it, i, marginBps) {
 
 export default function purchaseRoutes(db) {
   const r = Router()
-  r.use(requireRole('admin', 'pharmacist'))
+  r.use(requirePermission('purchases.manage'))
 
   const getPurchase = async (id) => {
     const p = await db.get('purchases', id)
@@ -115,6 +115,17 @@ export default function purchaseRoutes(db) {
     const items = body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('Add at least one item')
 
+    // Receiving against a purchase order: it must still be open (sent, not yet received/cancelled)
+    // and for the same supplier; marked received once the goods receipt below succeeds.
+    const purchaseOrderId = optInt(body, 'purchase_order_id', null, { min: 1, label: 'Purchase order' })
+    let purchaseOrder = null
+    if (purchaseOrderId) {
+      purchaseOrder = await db.get('purchase_orders', purchaseOrderId)
+      if (!purchaseOrder) throw badRequest('Purchase order not found')
+      if (purchaseOrder.supplier_id !== supplierId) throw badRequest('That purchase order is for a different supplier')
+      if (purchaseOrder.status !== 'sent') throw new HttpError(409, `This purchase order is ${purchaseOrder.status}, not open to receive against`)
+    }
+
     const settings = await getSettings(db)
     const margin = Number(settings.default_margin_bps)
     const marginBps = Number.isFinite(margin) && settings.default_margin_bps !== '' ? margin : 1500
@@ -129,7 +140,11 @@ export default function purchaseRoutes(db) {
       const purchaseId = await db.insert('purchases', {
         supplier_id: supplierId, invoice_no: optString(body, 'invoice_no'), invoice_date: invoiceDate, payment_type: paymentType,
         due_date: dueDate, gross, discount, total, notes: optString(body, 'notes'), user_id: req.user.id,
+        purchase_order_id: purchaseOrderId,
       })
+      if (purchaseOrderId) {
+        await db.col('purchase_orders').updateOne({ _id: purchaseOrderId }, { $set: { status: 'received', received_purchase_id: purchaseId } })
+      }
 
       for (const [i, l] of lines.entries()) {
         let batch = await db.col('batches').findOne({ product_id: l.product.id, batch_no: l.batch_no })

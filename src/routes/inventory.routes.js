@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, getSettings } from '../db.js'
 import { reqInt, reqString, optString, oneOf, badRequest } from '../lib/http.js'
 import { moveStock } from '../lib/stock.js'
@@ -29,7 +29,7 @@ export default function inventoryRoutes(db) {
     res.json(rows)
   })
 
-  r.get('/movements', requireRole('admin', 'pharmacist'), async (req, res) => {
+  r.get('/movements', requirePermission('inventory.manage'), async (req, res) => {
     const filter = req.query.product_id ? { product_id: Number(req.query.product_id) } : {}
     const rows = await db.all('stock_movements', filter, { sort: { id: -1 }, limit: 500 })
     res.json(await db.join(rows, [
@@ -40,7 +40,7 @@ export default function inventoryRoutes(db) {
   })
 
   // Manual correction: stock count, expired write-off, breakage.
-  r.post('/adjustments', requireRole('admin', 'pharmacist'), async (req, res) => {
+  r.post('/adjustments', requirePermission('inventory.manage'), async (req, res) => {
     const batchId = reqInt(req.body, 'batch_id', { min: 1, label: 'Batch' })
     const change = reqInt(req.body, 'change', { label: 'Quantity change' })
     if (change === 0) throw badRequest('Quantity change cannot be zero')

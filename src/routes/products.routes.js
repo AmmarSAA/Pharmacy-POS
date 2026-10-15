@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, nowStamp, getSettings } from '../db.js'
 import { HttpError, badRequest, notFound, reqString, optString, reqInt, optInt, oneOf } from '../lib/http.js'
 
@@ -179,14 +179,14 @@ export default function productRoutes(db) {
 
   const insert = (p) => db.insert('products', { ...p, name_lc: p.name.toLowerCase() })
 
-  r.post('/', requireRole('admin', 'pharmacist'), async (req, res) => {
+  r.post('/', requirePermission('products.manage'), async (req, res) => {
     const p = readProduct(req.body, await defaults())
     await assertBarcodeFree(p.barcode)
     const id = await insert(p)
     res.status(201).json(await products.findOne({ _id: id }, PLAIN))
   })
 
-  r.put('/:id', requireRole('admin', 'pharmacist'), async (req, res) => {
+  r.put('/:id', requirePermission('products.manage'), async (req, res) => {
     const id = Number(req.params.id)
     if (!(await products.findOne({ _id: id }))) throw notFound('Product')
     const p = readProduct(req.body, await defaults())
@@ -197,7 +197,7 @@ export default function productRoutes(db) {
 
   // Bulk import from an item list (e.g. MultiTec export). Matches existing items by barcode/item
   // code, otherwise by exact name; updates them, creates the rest. Bad rows are reported, not fatal.
-  r.post('/import', requireRole('admin', 'pharmacist'), async (req, res) => {
+  r.post('/import', requirePermission('products.manage'), async (req, res) => {
     const rows = req.body.rows
     if (!Array.isArray(rows) || rows.length === 0) throw badRequest('No rows to import')
     if (rows.length > 2000) throw badRequest('Import at most 2000 rows at a time')

@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, nowStamp, getSettings } from '../db.js'
 import { HttpError, badRequest, notFound, reqInt, reqString, optString, reqDate, oneOf } from '../lib/http.js'
 import { openTillFor, tillTotals, recordCashMovement } from '../lib/till.js'
@@ -162,7 +162,7 @@ export default function tillRoutes(db) {
   })
 
   // Body: { date } (default today)
-  r.post('/day-close', requireRole(...SUPERVISORS), async (req, res) => {
+  r.post('/day-close', requirePermission('tills.supervise'), async (req, res) => {
     const date = req.body.date ? reqDate(req.body, 'date', 'Date') : today()
     await db.tx(async () => {
       if (await db.col('day_closes').findOne({ business_date: date })) {

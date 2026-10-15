@@ -44,8 +44,9 @@ export async function tillTotals(db, sessionId) {
 }
 
 // Records cash leaving/entering the drawer of the user's open till.
-export async function recordCashMovement(db, { tillSessionId, direction, amount, reason, notes = null, supplierPaymentId = null, userId }) {
+export async function recordCashMovement(db, { tillSessionId, direction, amount, reason, notes = null, supplierPaymentId = null, customerPaymentId = null, userId }) {
   return db.insert('cash_movements', {
-    till_session_id: tillSessionId, direction, amount, reason, notes, supplier_payment_id: supplierPaymentId, user_id: userId,
+    till_session_id: tillSessionId, direction, amount, reason, notes,
+    supplier_payment_id: supplierPaymentId, customer_payment_id: customerPaymentId, user_id: userId,
   })
 }

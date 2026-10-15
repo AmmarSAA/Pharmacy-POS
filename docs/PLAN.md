@@ -181,3 +181,133 @@ The Cloudflare free plan's daily read limit on Durable Object storage stopped th
 - Assistant tools: `demand_suggestions` (read), `create_demand_list` and `mark_not_needed` (need approval).
 - Fixed: leaving the dashboard before its first load finished showed an error on the next page.
 - Tests: 97 on Node; browser check of suggestions → list → WhatsApp text, not-needed and a manual list.
+
+## Round 7 (roles & permissions)
+
+- Foundational change ahead of Rounds 8-11 (Odoo-style breadth): the fixed 3-role system (cashier/
+  pharmacist/admin) now sits on top of a configurable permission system, so an admin can create a
+  custom role (e.g. "HR Manager") with exactly the access it needs, instead of being stuck with one
+  of 3 fixed levels.
+- `src/lib/permissions.js`: the permission-key catalogue (18 keys, grouped), the 3 system roles
+  seeded with the exact permission sets that reproduce today's access unchanged, and `requirePermission`.
+- New `roles` collection (`key, name, base_role, is_system, permissions[]`). Every user now also has
+  `role_id`; the legacy `role` string stays in sync (= the role's `base_role`) because a handful of
+  business rules key off it directly rather than a permission: discount caps by role, cashiers barred
+  from controlled drugs, cashiers seeing only their own sales/tills. Those are unchanged.
+  `src/db.js` `initDb` seeds the 3 system roles once and migrates any user created before this round.
+- `src/routes/roles.routes.js`: `GET /api/roles/permissions` (the catalogue, for building a checkbox
+  UI), `GET/POST/PUT/DELETE /api/roles` (admin/`users.manage` only; built-in roles can be edited but
+  not deleted; a role still assigned to a user can't be deleted).
+- Every existing `requireRole('admin', 'pharmacist' | 'admin')` gate across the API (products,
+  suppliers, purchases, demand, issues, inventory, reports, sales returns, tills day-close, settings,
+  users) now reads `requirePermission(...)` instead, each mapped to the permission that reproduces
+  its old behaviour exactly.
+- `POST/PATCH /api/users` accepts `role_id` (any role) or, as a shorthand, the old `role` string
+  (resolved to the matching built-in role).
+- Tests: `test/roles.test.js` — role CRUD, a custom role's permissions actually gating API access,
+  built-in roles protected from deletion, and every existing role-gated test still passing unchanged.
+
+## Round 8 (operations gaps: purchase orders, customer accounts & loyalty, branch transfers)
+
+Three features the project's own "Later"/"Not included yet" lists had already named as deliberately
+deferred (not forgotten) — picked up first because they extend existing Purchase/Sales/Inventory
+code directly, rather than adding a new domain.
+
+- **Purchase orders**: new `purchase_orders`/`purchase_order_items` (`src/routes/purchase-orders.routes.js`,
+  `purchase_orders.manage`). Status `draft → sent → received|cancelled`, same transition-table shape
+  as demand lists. `POST /api/purchases` gained an optional `purchase_order_id`: receiving against a
+  *sent* order marks it `received` and links the resulting purchase, so "order" and "goods receipt"
+  stay two different documents, as intended. Front end: a Purchase Orders screen, and `purchaseForm`
+  (the existing "New purchase" dialog) now accepts an order to pre-fill from, reached via its
+  "Receive stock" action (`#/purchases?po=ID`).
+- **Customer accounts, credit & loyalty**: new `customers`/`customer_payments` and
+  `src/lib/customer-ledger.js` — a direct mirror of `supplier-ledger.js` (bills vs. payments, FIFO/
+  tied settlement, aging, running-balance statement), with "purchases" replaced by sales billed to
+  the account (payment_method `'account'`, net of any `'account'`-refunded returns) and payment
+  direction reversed (till cash moves `in`, not `out`). `sales.routes.js`: `'account'` is a 4th
+  payment method (`amount_paid: 0`, requires `customer_id`, refused offline like controlled drugs);
+  returns against an account sale always refund `'account'` (credit the balance), never cash, since
+  no cash changed hands at sale time. Loyalty: `loyalty_points_per_100rs` / `loyalty_point_value_paisa`
+  settings; points earn on the final total of any sale linked to a customer, and `redeem_points`
+  applies as an order-level discount (capped at the live balance, checked again inside the
+  transaction). Front end: a Customers screen (list/ledger/payment, mirroring Suppliers), and the POS
+  screen gained an optional "link a customer account" search with a redeem-points field and `Account`
+  as a 4th payment button.
+- **Branch-to-branch stock transfer**: scoped deliberately smaller than a second live-inventory
+  location (`PLAN.md`'s original "Later" list named "multiple godowns" as a bigger, separate change).
+  New `locations`/`stock_transfers`/`stock_transfer_items` (`src/routes/transfers.routes.js`,
+  `transfers.manage`). Sending stock decrements this location's batches immediately via FEFO — the
+  same one-way, at-cost, tracked pattern `issues.routes.js` already uses for department issues, just
+  to a named location instead of a department. `POST /:id/receive` only acknowledges the other site
+  got it (no second location gets its own sellable stock yet); `POST /:id/cancel` reverses the stock
+  movement for a mistake, before it's been received.
+- Tests: `test/operations.test.js` — account sale → ledger → payment → redeemed/earned loyalty points,
+  an account-sale return crediting the account not the drawer, a full purchase-order lifecycle
+  including stock actually landing on receipt, and send/receive/cancel for a transfer with the stock
+  figure checked at each step.
+- Known gap, not attempted this round: a true second sellable-stock location (POS search, FEFO,
+  demand suggestions, reports) for transfers — flagged above, not silently dropped.
+
+## Round 9 (people & HR)
+
+- Recordkeeping on top of the existing `users` table, deliberately not a new permissions model —
+  Round 7 already generalised roles/permissions, so this round only needed `hr.manage` as one more
+  permission key, not more access-control work.
+- New `employees` collection (`src/routes/employees.routes.js`, `hr.manage`): hire date, phone,
+  address, CNIC, salary, job title, emergency contact, notes. `user_id` optionally links an employee
+  to a login account (one employee per user, enforced by a partial unique index) — an employee
+  without system access (e.g. a delivery rider) is just as valid a record, with `user_id: null`.
+- Front end: an Employees screen (list + form), gated in the nav the same way every other permission-
+  gated screen is.
+- Tests: `test/employees.test.js` — standalone and user-linked records, the one-employee-per-user
+  rule, unlinking a user, and that a cashier (no `hr.manage`) is refused.
+
+## Round 10 (scheduling & collaboration)
+
+Three independent, deliberately small features — no new external front-end dependency was added
+for any of them (no calendar widget, no rich-text editor, no WebSocket/real-time layer), matching
+the project's existing no-build-step, dependency-light front end.
+
+- **Appointments**: new `appointments` collection (`src/routes/appointments.routes.js`). Anyone
+  signed in can book, edit and cancel their *own* appointments with no permission needed (same
+  "everyone gets the basics" posture as, say, opening a till); `calendar.manage_all` additionally
+  lets staff book/see/manage *everyone's* (building a shift roster, booking a consultation on
+  someone else's calendar). Front end is a plain list grouped by date — not a calendar grid.
+- **Staff messaging**: new `messages` collection (`src/routes/messages.routes.js`), open to every
+  signed-in user, no permission gate — direct messages only (closer to Odoo Discuss's DMs than its
+  channels), with an aggregation-built thread list (`GET /messages/threads`) and per-thread
+  read-marking. Front end: a two-pane inbox (threads + conversation), no live polling — matches the
+  "online-only, refresh to see new messages" posture already used for every other admin screen.
+- **Knowledge wiki**: new `knowledge_articles` collection (`src/routes/knowledge.routes.js`). Reading
+  is open to everyone signed in; writing needs `knowledge.manage`. Body is plain text (no markdown
+  rendering, no WYSIWYG) with simple title/body substring search and tag filtering.
+- Tests: `test/collaboration.test.js` — own-vs-everyone appointment visibility and edit rights,
+  a two-way message exchange with unread counts, and knowledge read-for-everyone/write-gated.
+- Fixed along the way: the `/messages/threads` aggregation needed `id` as a sort tiebreaker
+  alongside `created_at` — two messages in the same second otherwise sorted non-deterministically
+  and `$first` could pick the wrong one as "last message".
+
+## Round 11 (business intelligence)
+
+- Almost entirely a front-end round: no new collections, no new permission — reuses `reports.view`
+  and the existing `/reports/summary` and `/reports/top-products` aggregation endpoints (Round 1)
+  rather than re-deriving gross profit, revenue, or payment totals a second time.
+- Generalised the dashboard's existing hand-rolled inline-SVG bar chart (`salesChartHtml`/
+  `bindChart`, fixed at 7 days with "today" highlighted) into `trendChartHtml`, usable for any date
+  range, keeping the same accessible hit-overlay/tooltip mechanism (`bindChart` needed no changes).
+  Added two more chart primitives in the same hand-drawn style: `hBarChartHtml` (CSS-width
+  horizontal bars, for top products) and `donutChartHtml` (SVG stroke-dasharray, for the payment-
+  method split) — no charting library was added, consistent with the project never having taken a
+  front-end dependency for this.
+- New Analytics screen (`#/analytics`, gated `reports.view`): a date-range picker (defaults to the
+  last 30 days), 4 KPI tiles (net sales, invoices, gross profit, returns), the daily sales trend,
+  top 8 products by revenue, and the payment-method split — sitting alongside, not replacing, the
+  existing text-table Reports screen.
+- No new tests: the round added no new backend behaviour to test; the underlying endpoints are
+  already covered by Round 1's report tests.
+
+---
+
+All 4 rounds requested (roles & permissions, operations gaps, people & HR, scheduling &
+collaboration, business intelligence — 5 rounds once the foundational roles/permissions work is
+split out) are complete: 128 tests passing on Node, zero regressions in any prior round.

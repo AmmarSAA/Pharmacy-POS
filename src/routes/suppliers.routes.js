@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today } from '../db.js'
 import { badRequest, notFound, reqString, optString, reqInt, optInt, optDate, oneOf } from '../lib/http.js'
 import { supplierDues, supplierLedger, tillForSupplierPayment, recordSupplierPayment } from '../lib/supplier-ledger.js'
@@ -35,7 +35,7 @@ const withDues = (s, d) => ({ ...s, balance: d?.balance ?? 0, overdue: d?.overdu
 
 export default function supplierRoutes(db) {
   const r = Router()
-  r.use(requireRole('admin', 'pharmacist'))
+  r.use(requirePermission('suppliers.manage'))
 
   const getSupplier = async (id) => {
     const s = await db.get('suppliers', Number(id))

@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, nowStamp } from '../db.js'
 import { HttpError, badRequest, notFound, reqInt, optInt, optString, oneOf } from '../lib/http.js'
 import { addDays } from '../lib/supplier-ledger.js'
@@ -157,7 +157,7 @@ async function loadList(db, id) {
 
 export default function demandRoutes(db) {
   const r = Router()
-  r.use(requireRole('admin', 'pharmacist'))
+  r.use(requirePermission('demand.manage'))
 
   // ?days=30 (use window) &cover_days=21 (how long the order should last) &supplier_id= (0 = no supplier yet)
   r.get('/suggestions', async (req, res) => {

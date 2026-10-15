@@ -23,7 +23,14 @@ const today = () => {
   const d = new Date()
   return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
 }
+const daysAgo = (n) => {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
+}
 const can = (...roles) => roles.includes(state.user?.role)
+const hasPerm = (perm) => (state.user?.permissions || []).includes(perm)
+const ROLE_KEYS = ['cashier', 'pharmacist', 'admin']
 const productLabel = (p) => [p.name, p.strength, p.form].filter(Boolean).join(' · ')
 const schedBadge = (s) =>
   s === 'otc' ? '' : `<span class="badge ${s}">${s === 'rx' ? 'Rx' : 'CONTROLLED'}</span>`
@@ -393,16 +400,28 @@ const ROUTES = [
   { path: 'sales', label: 'Sales & returns', view: salesView },
   { path: 'products', label: 'Products', view: productsView },
   { path: 'stock', label: 'Stock & expiry', view: stockView },
-  { path: 'purchases', label: 'Purchases', view: purchasesView, roles: ['admin', 'pharmacist'] },
-  { path: 'demand', label: 'Demand list', view: demandView, roles: ['admin', 'pharmacist'] },
-  { path: 'suppliers', label: 'Suppliers', view: suppliersView, roles: ['admin', 'pharmacist'] },
-  { path: 'reports', label: 'Reports', view: reportsView, roles: ['admin', 'pharmacist'] },
-  { path: 'issues', label: 'Issues', view: issuesView, roles: ['admin', 'pharmacist'] },
-  { path: 'users', label: 'Users', view: usersView, roles: ['admin'] },
+  { path: 'purchases', label: 'Purchases', view: purchasesView, perm: 'purchases.manage' },
+  { path: 'purchase-orders', label: 'Purchase orders', view: purchaseOrdersView, perm: 'purchase_orders.manage' },
+  { path: 'demand', label: 'Demand list', view: demandView, perm: 'demand.manage' },
+  { path: 'suppliers', label: 'Suppliers', view: suppliersView, perm: 'suppliers.manage' },
+  { path: 'customers', label: 'Customers', view: customersView, perm: 'customers.manage' },
+  { path: 'transfers', label: 'Transfers', view: transfersView, perm: 'transfers.manage' },
+  { path: 'reports', label: 'Reports', view: reportsView, perm: 'reports.view' },
+  { path: 'analytics', label: 'Analytics', view: analyticsView, perm: 'reports.view' },
+  { path: 'issues', label: 'Issues', view: issuesView, perm: 'issues.manage' },
+  { path: 'employees', label: 'Employees', view: employeesView, perm: 'hr.manage' },
+  { path: 'appointments', label: 'Appointments', view: appointmentsView },
+  { path: 'messages', label: 'Messages', view: messagesView },
+  { path: 'knowledge', label: 'Knowledge', view: knowledgeView },
+  { path: 'users', label: 'Users', view: usersView, perm: 'users.manage' },
+  { path: 'roles', label: 'Roles', view: rolesView, perm: 'users.manage' },
   { path: 'owner', label: 'Owner', view: ownerView, ownerOnly: true },
   { path: 'settings', label: 'Settings', view: settingsView },
 ]
-const allowed = () => ROUTES.filter((r) => (!r.roles || can(...r.roles)) && (!r.ownerOnly || state.user?.is_owner))
+// `roles` (legacy, base-role) and `perm` (permission key) are both supported; most routes now use
+// perm so a custom role sees exactly the screens its permissions unlock.
+const allowed = () => ROUTES.filter((r) =>
+  (!r.roles || can(...r.roles)) && (!r.perm || hasPerm(r.perm)) && (!r.ownerOnly || state.user?.is_owner))
 let teardown = null
 let routeSeq = 0
 
@@ -412,7 +431,7 @@ function renderShell() {
       <div class="brand">${esc(state.settings.pharmacy_name)}</div>
       ${allowed().map((r) => `<a href="#/${r.path}" data-path="${r.path}">${r.label}</a>`).join('')}
       <div class="net" id="net" aria-live="polite"></div>
-      <div class="who">${esc(state.user.full_name)}<br><span>${esc(state.user.role)}${state.user.is_owner ? ' · owner' : ''}</span><br>
+      <div class="who">${esc(state.user.full_name)}<br><span>${esc(state.user.role_name || state.user.role)}${state.user.is_owner ? ' · owner' : ''}</span><br>
         <button class="link" id="logout">Sign out</button></div>
     </nav>
     <main id="view"></main>
@@ -808,7 +827,7 @@ const tillBlocks = (till) => state.settings.require_open_till === '1' && till &&
 
 function posView(view) {
   const rxDefaults = () => ({ patient_name: '', patient_phone: '', patient_cnic: '', prescriber_name: '', prescriber_reg_no: '', rx_date: today(), notes: '' })
-  const pos = { cart: [], results: [], hl: 0, method: 'cash', paid: '', customer: '', phone: '', rx: rxDefaults(), busy: false, till: null }
+  const pos = { cart: [], results: [], hl: 0, method: 'cash', paid: '', customer: '', phone: '', rx: rxDefaults(), busy: false, till: null, account: null, redeemPoints: '' }
   const maxDiscount = discountCapPct(state.user.role)
 
   view.innerHTML = `<div class="pos">
@@ -1004,8 +1023,17 @@ function posView(view) {
           <label class="field" style="flex:1">Customer<input id="cust" value="${esc(pos.customer)}" placeholder="Optional"></label>
           <label class="field" style="flex:1">Phone<input id="phone" value="${esc(pos.phone)}" placeholder="Optional"></label>
         </div>
+        <div class="field">
+          ${pos.account
+            ? `Account: <b>${esc(pos.account.name)}</b> (${pos.account.loyalty_points || 0} points)
+               <button type="button" class="link" id="acct-clear">change</button>`
+            : `<input id="acct-search" placeholder="Link a customer account (optional, for billing to account or loyalty points)" autocomplete="off">
+               <div class="results" id="acct-results" hidden></div>`}
+        </div>
+        ${pos.account && pos.account.loyalty_points > 0 ? `<label class="field">Redeem points (has ${pos.account.loyalty_points})
+          <input id="redeem" type="number" min="0" max="${pos.account.loyalty_points}" value="${esc(pos.redeemPoints)}"></label>` : ''}
         <div class="pay-methods">
-          ${['cash', 'card', 'wallet'].map((m) => `<button type="button" data-method="${m}" class="${pos.method === m ? 'sel' : ''}">${{ cash: 'Cash', card: 'Card', wallet: 'JazzCash / Easypaisa' }[m]}</button>`).join('')}
+          ${['cash', 'card', 'wallet', 'account'].map((m) => `<button type="button" data-method="${m}" class="${pos.method === m ? 'sel' : ''}" ${m === 'account' && !pos.account ? 'disabled title="Link a customer account first"' : ''}>${{ cash: 'Cash', card: 'Card', wallet: 'JazzCash / Easypaisa', account: 'Account' }[m]}</button>`).join('')}
         </div>
         ${pos.method === 'cash' ? `
           <div class="row">
@@ -1013,6 +1041,7 @@ function posView(view) {
             <div class="spacer"></div>
             <div class="num"><div class="muted">Change</div><div style="font-size:20px;font-weight:700;${change < 0 ? 'color:var(--danger)' : ''}">${rs(change)}</div></div>
           </div>` : ''}
+        ${pos.method === 'account' ? '<p class="muted" style="font-size:13px">Billed to the account; nothing is collected now.</p>' : ''}
         <button class="primary checkout" id="checkout" ${pos.cart.length === 0 || pos.busy || blocked ? 'disabled' : ''}>Complete sale <span class="kbd">F9</span></button>
         ${blocked ? '<div class="alert">Open your till to complete sales.</div>' : ''}
         ${pos.cart.length ? '<button id="clear" class="link danger">Clear cart</button>' : ''}
@@ -1021,7 +1050,38 @@ function posView(view) {
     $('#rx', side)?.addEventListener('input', (e) => (pos.rx[e.target.name] = e.target.value))
     $('#cust', side).addEventListener('input', (e) => (pos.customer = e.target.value))
     $('#phone', side).addEventListener('input', (e) => (pos.phone = e.target.value))
+    $('#redeem', side)?.addEventListener('input', (e) => (pos.redeemPoints = e.target.value))
+    $('#acct-clear', side)?.addEventListener('click', () => {
+      pos.account = null
+      pos.redeemPoints = ''
+      if (pos.method === 'account') pos.method = 'cash'
+      renderSide()
+    })
+    const acctInput = $('#acct-search', side)
+    if (acctInput) {
+      let acctTimer = null
+      acctInput.addEventListener('input', () => {
+        clearTimeout(acctTimer)
+        const text = acctInput.value.trim()
+        acctTimer = setTimeout(guard(async () => {
+          const results = $('#acct-results', side)
+          if (!text) { results.hidden = true; return }
+          const rows = await get(`/customers?q=${encodeURIComponent(text)}&active=1`)
+          results.hidden = rows.length === 0
+          results.innerHTML = rows.map((c) => `<button type="button" data-pick="${c.id}">
+            <div style="flex:1"><div class="name">${esc(c.name)}</div><div class="muted">${esc(c.phone || '')}</div></div>
+            <div class="num muted">${c.loyalty_points || 0} pts</div></button>`).join('')
+          results.onclick = (e) => {
+            const b = e.target.closest('[data-pick]')
+            if (!b) return
+            pos.account = rows.find((c) => c.id === Number(b.dataset.pick))
+            renderSide()
+          }
+        }), 200)
+      })
+    }
     $$('[data-method]', side).forEach((b) => b.addEventListener('click', () => {
+      if (b.disabled) return
       pos.method = b.dataset.method
       renderSide()
     }))
@@ -1040,7 +1100,7 @@ function posView(view) {
   }
 
   function reset() {
-    Object.assign(pos, { cart: [], method: 'cash', paid: '', customer: '', phone: '', rx: rxDefaults() })
+    Object.assign(pos, { cart: [], method: 'cash', paid: '', customer: '', phone: '', rx: rxDefaults(), account: null, redeemPoints: '' })
     render()
     q.focus()
   }
@@ -1048,6 +1108,7 @@ function posView(view) {
   const checkout = guard(async () => {
     if (!pos.cart.length || pos.busy) return
     if (tillBlocks(pos.till)) return toast('Open your till before selling', true)
+    if (pos.method === 'account' && !pos.account) return toast('Link a customer account to sell on account', true)
     const t = totals()
     const body = {
       items: pos.cart.map((l) => ({ product_id: l.product.id, packs: l.packs, loose: l.loose, discount_bps: Math.round(l.discount * 100) })),
@@ -1056,6 +1117,8 @@ function posView(view) {
       customer_phone: pos.phone,
     }
     if (pos.method === 'cash') body.amount_paid = pos.paid === '' ? t.total : toPaisa(pos.paid)
+    if (pos.account) body.customer_id = pos.account.id
+    if (pos.account && pos.redeemPoints) body.redeem_points = Number(pos.redeemPoints) || 0
     if (needsRx()) body.prescription = pos.rx
     pos.busy = true
     renderSide()
@@ -1631,6 +1694,12 @@ async function purchasesView(view) {
     history.replaceState(null, '', '#/purchases')
     guard(() => purchaseForm(load))()
   }
+  // #/purchases?po=123 ("Receive" on a sent purchase order) opens the form pre-filled from it.
+  if (hashParam('po')) {
+    const poId = hashParam('po')
+    history.replaceState(null, '', '#/purchases')
+    guard(async () => purchaseForm(load, await get(`/purchase-orders/${poId}`)))()
+  }
 }
 
 function purchaseDetail(p) {
@@ -1658,15 +1727,15 @@ function purchaseDetail(p) {
 
 const PURCHASE_COLS = ['Product', 'Batch', 'Expiry', 'P/Unit', 'Packs', 'Loose', 'Bonus', 'Pack cost Rs', 'Disc %', 'Net cost/pack', 'Sale price/pack Rs', 'Margin %', 'Mark-up %', 'Line total', '']
 
-const purchaseRowHtml = () => `<tr>
-  <td><input name="product" list="plist" placeholder="Type to search" class="w-prod" aria-label="Product"></td>
+const purchaseRowHtml = (pre = {}) => `<tr>
+  <td><input name="product" list="plist" placeholder="Type to search" class="w-prod" aria-label="Product" value="${esc(pre.product || '')}"></td>
   <td><input name="batch_no" class="w-batch" aria-label="Batch"></td>
   <td><input name="expiry_date" type="date" class="w-date" aria-label="Expiry"></td>
   <td class="num" data-ps>—</td>
-  <td><input name="packs" type="number" min="0" class="w-n" aria-label="Packs"></td>
-  <td><input name="loose_qty" type="number" min="0" class="w-n" aria-label="Loose units"></td>
+  <td><input name="packs" type="number" min="0" class="w-n" aria-label="Packs" value="${pre.packs ?? ''}"></td>
+  <td><input name="loose_qty" type="number" min="0" class="w-n" aria-label="Loose units" value="${pre.loose_qty ?? ''}"></td>
   <td><input name="bonus_qty" type="number" min="0" class="w-n" aria-label="Bonus units"></td>
-  <td><input name="pack_cost" inputmode="decimal" class="w-money" aria-label="Pack cost"></td>
+  <td><input name="pack_cost" inputmode="decimal" class="w-money" aria-label="Pack cost" value="${pre.pack_cost ?? ''}"></td>
   <td><input name="disc" inputmode="decimal" class="w-n" aria-label="Discount percent"></td>
   <td class="num" data-net></td>
   <td><input name="pack_price" inputmode="decimal" class="w-money" aria-label="Sale price per pack"></td>
@@ -1718,7 +1787,7 @@ function calcPurchaseRow(tr, product, source) {
   return { packs, loose, bonus, units, gross, discount, net: gross - discount }
 }
 
-async function purchaseForm(onSaved) {
+async function purchaseForm(onSaved, fromPO = null) {
   const [suppliers, products] = await Promise.all([get('/suppliers'), get('/products/pick')])
   const active = suppliers.filter((s) => s.active !== 0)
   if (!active.length) {
@@ -1726,6 +1795,7 @@ async function purchaseForm(onSaved) {
     location.hash = '#/suppliers'
     return
   }
+  const byId = new Map(products.map((p) => [p.id, p]))
   const optLabel = (p) => `${productLabel(p)} #${p.id}`
   const byLabel = new Map(products.map((p) => [optLabel(p), p]))
   // Exact pick from the list; otherwise a scanned barcode/item code, or a name only one item matches.
@@ -1745,8 +1815,9 @@ async function purchaseForm(onSaved) {
   const m = modal(`<form id="pf" autocomplete="off">
     <div class="row"><h2>New purchase</h2><div class="spacer"></div><span class="muted" style="font-size:12px"><span class="kbd">Enter</span> next field · <span class="kbd">Ctrl+I</span> add row</span></div>
     <div class="grid">
-      <label class="field">Supplier *<select name="supplier_id">${active.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
+      <label class="field">Supplier *<select name="supplier_id" ${fromPO ? 'disabled' : ''}>${active.map((s) => `<option value="${s.id}" ${fromPO && s.id === fromPO.supplier_id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
         <span id="sup-info" class="muted" style="font-size:12px"></span></label>
+      ${fromPO ? `<p class="muted" style="font-size:13px;align-self:end">Receiving against order ${esc(fromPO.id)}. Add the batch number and expiry for each line.</p>` : ''}
       <label class="field">Supplier invoice no<input name="invoice_no"></label>
       <label class="field">Invoice date<input name="invoice_date" type="date" value="${today()}"></label>
       <label class="field">Payment type<select name="payment_type"><option value="credit">Credit</option><option value="cash">Cash</option></select>
@@ -1756,7 +1827,12 @@ async function purchaseForm(onSaved) {
     <datalist id="plist">${products.map((p) => `<option value="${esc(optLabel(p))}">`).join('')}</datalist>
     <div class="table-wrap purchase-grid" style="margin-top:12px"><table>
       <thead><tr>${PURCHASE_COLS.map((c, i) => `<th class="${i >= 3 && i !== 10 ? 'num' : ''}">${esc(c)}</th>`).join('')}</tr></thead>
-      <tbody id="lines">${purchaseRowHtml()}</tbody></table></div>
+      <tbody id="lines">${fromPO
+        ? fromPO.items.map((i) => {
+            const p = byId.get(i.product_id)
+            return purchaseRowHtml({ product: p ? `${productLabel(p)} #${p.id}` : '', packs: i.packs, loose_qty: i.loose_qty, pack_cost: i.pack_cost })
+          }).join('')
+        : purchaseRowHtml()}</tbody></table></div>
     <button type="button" class="link" id="addline">+ Add row</button>
     <div class="purchase-foot" id="pfoot"></div>
     <p class="muted" style="font-size:13px">Packs and pack prices as on the supplier bill; loose and bonus are single units. Blank sale price uses the product's pack price, or cost + ${pct(state.settings.default_margin_bps ?? 1500)} margin.</p>
@@ -1872,13 +1948,15 @@ async function purchaseForm(onSaved) {
     const d = formData(form)
     await post('/purchases', {
       supplier_id: Number(d.supplier_id), invoice_no: d.invoice_no, invoice_date: d.invoice_date,
-      payment_type: d.payment_type, ...(d.payment_type === 'cash' ? { payment_method: d.payment_method } : {}), items,
+      payment_type: d.payment_type, ...(d.payment_type === 'cash' ? { payment_method: d.payment_method } : {}),
+      ...(fromPO ? { purchase_order_id: fromPO.id } : {}), items,
     })
     m.close()
-    toast('Stock received')
+    toast(fromPO ? `Order ${fromPO.id} received` : 'Stock received')
     onSaved()
   }))
   supplierInfo()
+  for (const tr of $$('tr', tbody)) onProduct(tr)
   recalcAll()
 }
 
@@ -1969,7 +2047,7 @@ function paymentDialog(supplier, onSaved) {
   }))
 }
 
-const LEDGER_TYPES = { opening: 'Opening', purchase: 'Purchase', payment: 'Payment' }
+const LEDGER_TYPES = { opening: 'Opening', purchase: 'Purchase', sale: 'Sale', payment: 'Payment' }
 
 async function supplierLedgerView(view, id) {
   const f = { from: '', to: today() }
@@ -2132,24 +2210,29 @@ async function usersView(view) {
   view.innerHTML = `<div class="stack">
     <div class="row"><h1>Users</h1><div class="spacer"></div><button class="primary" id="add">Add user</button></div>
     <div class="panel table-wrap" id="list"></div>
-    <p class="muted" style="font-size:13px">Cashiers: sell, see only their own sales. Pharmacists: also controlled drugs, returns, stock, purchases, reports and department issues. Admins: everything including users and settings. Discount limits per role are set by the owner. Only the owner can add or change admins.</p></div>`
+    <p class="muted" style="font-size:13px">Cashiers: sell, see only their own sales. Pharmacists: also controlled drugs, returns, stock, purchases, reports and department issues. Admins: everything including users and settings. Discount limits per role are set by the owner. Only the owner can add or change admins. Need something in between? Build a <a href="#/roles">custom role</a>.</p></div>`
   let rows = []
   const isOwner = !!state.user.is_owner
   // Only the owner may touch admin accounts.
   const editable = (u) => isOwner || u.role !== 'admin'
+  const allRoles = await get('/roles')
+  const roleById = new Map(allRoles.map((r) => [r.id, r]))
+  // A non-owner admin can assign any role except one whose base_role is admin.
+  const selectableRoles = allRoles.filter((r) => isOwner || r.base_role !== 'admin')
   const load = async () => {
     rows = await get('/users')
     $('#list', view).innerHTML = `<table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Created</th></tr></thead>
       <tbody>${rows.map((u) => `<tr class="${editable(u) ? 'clickable' : ''}" data-id="${u.id}"><td>${esc(u.full_name)}</td><td>${esc(u.username)}</td>
-        <td>${esc(u.role)} ${u.is_owner ? '<span class="badge ok">Owner</span>' : ''}${editable(u) ? '' : ' <span class="muted" style="font-size:12px">read-only</span>'}</td>
+        <td>${esc(roleById.get(u.role_id)?.name || u.role)} ${u.is_owner ? '<span class="badge ok">Owner</span>' : ''}${editable(u) ? '' : ' <span class="muted" style="font-size:12px">read-only</span>'}</td>
         <td>${u.active ? 'Active' : '<span class="muted">Disabled</span>'}</td><td>${esc(u.created_at)}</td></tr>`).join('')}</tbody></table>`
   }
   const form = (u) => {
-    const roleSel = (r) => (isOwner ? ['cashier', 'pharmacist', 'admin'] : ['cashier', 'pharmacist']).map((x) => `<option ${x === r ? 'selected' : ''}>${x}</option>`).join('')
+    const roleSel = (id) => selectableRoles.map((r) => `<option value="${r.id}" ${r.id === id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')
+    const defaultRoleId = allRoles.find((r) => r.key === 'cashier')?.id
     const m = modal(`<form id="uf"><h2>${u ? `Edit ${esc(u.username)}` : 'Add user'}</h2><div class="grid">
       ${u ? '' : '<label class="field">Username *<input name="username" required></label>'}
       <label class="field">Full name *<input name="full_name" value="${esc(u?.full_name)}" required></label>
-      ${u?.is_owner ? '<div class="field">Role<div><b>admin</b> <span class="badge ok">Owner</span></div></div>' : `<label class="field">Role<select name="role">${roleSel(u?.role || 'cashier')}</select></label>`}
+      ${u?.is_owner ? '<div class="field">Role<div><b>admin</b> <span class="badge ok">Owner</span></div></div>' : `<label class="field">Role<select name="role_id">${roleSel(u?.role_id ?? defaultRoleId)}</select></label>`}
       <label class="field">${u ? 'New password (leave blank to keep)' : 'Password *'}<input name="password" type="password" minlength="8" ${u ? '' : 'required'} autocomplete="new-password"></label>
       </div>
       ${u && !u.is_owner ? `<label class="row" style="margin-top:10px"><input type="checkbox" name="active" ${u.active ? 'checked' : ''}> Active</label>` : ''}
@@ -2158,6 +2241,7 @@ async function usersView(view) {
     $('#uf', m.el).addEventListener('submit', guard(async (e) => {
       e.preventDefault()
       const d = formData(e.target)
+      if (d.role_id) d.role_id = Number(d.role_id)
       if (u) {
         if (!d.password) delete d.password
         await patch(`/users/${u.id}`, d)
@@ -2175,6 +2259,689 @@ async function usersView(view) {
     const u = tr && rows.find((x) => x.id === Number(tr.dataset.id))
     if (u && editable(u)) form(u)
   })
+  await load()
+}
+
+// ---------- roles ----------
+
+const BASE_ROLE_HELP = {
+  cashier: 'Sees only their own sales and tills; cannot sell controlled drugs; discount capped at the cashier limit.',
+  pharmacist: 'Sees pharmacy-wide sales and tills; can sell controlled drugs; discount capped at the pharmacist limit.',
+  admin: 'Sees pharmacy-wide sales and tills; can sell controlled drugs; discount capped at the admin limit.',
+}
+
+async function rolesView(view) {
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Roles</h1><div class="spacer"></div><button class="primary" id="add">New role</button></div>
+    <div class="panel table-wrap" id="list"></div>
+    <p class="muted" style="font-size:13px">A role's permissions decide which screens and actions it can use. Its base role decides a few things that are not permissions: whether it can sell controlled drugs, its discount limit, and whether it sees the whole pharmacy's sales or only its own.</p></div>`
+  let rows = []
+  const perms = await get('/roles/permissions')
+  const groups = []
+  for (const p of perms) {
+    let g = groups.find((x) => x.name === p.group)
+    if (!g) groups.push((g = { name: p.group, perms: [] }))
+    g.perms.push(p)
+  }
+  const load = async () => {
+    rows = await get('/roles')
+    $('#list', view).innerHTML = `<table><thead><tr><th>Name</th><th>Base role</th><th>Permissions</th><th>Users</th><th></th></tr></thead>
+      <tbody>${rows.map((r) => `<tr class="clickable" data-id="${r.id}"><td>${esc(r.name)} ${r.is_system ? '<span class="badge ok">Built-in</span>' : ''}</td>
+        <td>${esc(r.base_role)}</td><td>${r.permissions.length}</td><td>${r.user_count}</td>
+        <td>${!r.is_system && !r.user_count ? `<button class="link danger" data-del="${r.id}">Delete</button>` : ''}</td></tr>`).join('')}</tbody></table>`
+  }
+  const form = (role) => {
+    const checked = new Set(role?.permissions || (role ? [] : ['sales.use']))
+    const m = modal(`<form id="rf"><h2>${role ? `Edit ${esc(role.name)}` : 'New role'}</h2>
+      <div class="grid">
+        <label class="field">Name *<input name="name" value="${esc(role?.name)}" required ${role?.is_system ? 'readonly' : ''}></label>
+        <label class="field">Base role<select name="base_role">${ROLE_KEYS.map((k) => `<option value="${k}" ${k === (role?.base_role || 'cashier') ? 'selected' : ''}>${k}</option>`).join('')}</select></label>
+      </div>
+      <p class="muted" id="base-help" style="font-size:13px">${BASE_ROLE_HELP[role?.base_role || 'cashier']}</p>
+      <h3>Permissions</h3>
+      <div class="stack">${groups.map((g) => `<fieldset><legend>${esc(g.name)}</legend>${g.perms.map((p) => `
+        <label class="row"><input type="checkbox" name="perm" value="${p.key}" ${checked.has(p.key) ? 'checked' : ''}> ${esc(p.label)}</label>`).join('')}</fieldset>`).join('')}</div>
+      <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`, { wide: true })
+    $('select[name=base_role]', m.el).addEventListener('change', (e) => {
+      $('#base-help', m.el).textContent = BASE_ROLE_HELP[e.target.value]
+    })
+    $('#rf', m.el).addEventListener('submit', guard(async (e) => {
+      e.preventDefault()
+      const fd = new FormData(e.target)
+      const body = { name: fd.get('name'), base_role: fd.get('base_role'), permissions: fd.getAll('perm') }
+      if (role) await put(`/roles/${role.id}`, body)
+      else await post('/roles', body)
+      m.close()
+      toast('Role saved')
+      await load()
+    }))
+  }
+  $('#add', view).addEventListener('click', () => form(null))
+  $('#list', view).addEventListener('click', guard(async (e) => {
+    const del = e.target.closest('[data-del]')
+    if (del) {
+      if (!confirm('Delete this role?')) return
+      await api('DELETE', `/roles/${del.dataset.del}`)
+      toast('Role deleted')
+      return load()
+    }
+    const tr = e.target.closest('tr[data-id]')
+    const role = tr && rows.find((x) => x.id === Number(tr.dataset.id))
+    if (role) form(role)
+  }))
+  await load()
+}
+
+// ---------- customers ----------
+
+async function customersView(view) {
+  const id = Number(hashParam('id'))
+  if (id) return customerLedgerView(view, id)
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Customers</h1><div class="spacer"></div>
+      <label class="row" style="font-size:13px"><input type="checkbox" id="inactive"> Show inactive</label>
+      <button class="primary" id="add">Add customer</button></div>
+    <div class="panel table-wrap" id="list"></div></div>`
+  let rows = []
+  const load = async () => {
+    rows = await get('/customers')
+    const shown = $('#inactive', view).checked ? rows : rows.filter((c) => c.active !== 0)
+    $('#list', view).innerHTML = shown.length === 0 ? '<p class="muted">No customer accounts yet. Walk-in sales do not need one.</p>' : `<table>
+      <thead><tr><th>Name</th><th>Phone</th><th class="num">Points</th><th class="num">Balance</th><th class="num">Overdue</th></tr></thead>
+      <tbody>${shown.map((c) => `<tr class="clickable ${c.overdue > 0 ? 'overdue' : ''}" data-id="${c.id}">
+        <td>${esc(c.name)} ${c.active === 0 ? '<span class="muted">(inactive)</span>' : ''}</td><td>${esc(c.phone || '')}</td>
+        <td class="num">${c.loyalty_points || 0}</td><td class="num">${c.balance ? rs(c.balance) : ''}</td>
+        <td class="num">${c.overdue > 0 ? `<b>${rs(c.overdue)}</b>` : ''}</td></tr>`).join('')}</tbody></table>`
+  }
+  $('#add', view).addEventListener('click', () => customerForm(null, load))
+  $('#inactive', view).addEventListener('change', guard(load))
+  $('#list', view).addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-id]')
+    if (tr) location.hash = `#/customers?id=${tr.dataset.id}`
+  })
+  await load()
+}
+
+function customerForm(c, onSaved) {
+  const v = c || { active: 1, due_days: 0, opening_balance: 0 }
+  const m = modal(`<form id="cf"><h2>${c ? 'Edit' : 'Add'} customer</h2><div class="grid">
+    <label class="field">Name *<input name="name" value="${esc(v.name)}" required></label>
+    <label class="field">Phone<input name="phone" value="${esc(v.phone)}"></label>
+    <label class="field">CNIC<input name="cnic" value="${esc(v.cnic)}"></label>
+    <label class="field">Address<input name="address" value="${esc(v.address)}"></label>
+    <label class="field">Account credit terms (due days)<input name="due_days" type="number" min="0" value="${esc(v.due_days ?? 0)}"></label>
+    <label class="field">Opening balance owed (Rs)<input name="opening_balance" inputmode="decimal" value="${toRupees(v.opening_balance)}"></label>
+    <label class="field">Opening balance date<input name="opening_date" type="date" value="${esc(v.opening_date || '')}"></label></div>
+    <label class="row" style="margin-top:10px"><input type="checkbox" name="active" ${v.active !== 0 ? 'checked' : ''}> Active</label>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`, { wide: true })
+  $('#cf', m.el).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    const d = formData(e.target)
+    const opening = d.opening_balance.trim() === '' ? 0 : paisaOrNull(d.opening_balance)
+    if (opening === null) throw new Error('Enter a valid opening balance')
+    const body = { ...d, due_days: Number(d.due_days) || 0, opening_balance: opening, opening_date: d.opening_date || null }
+    if (c) await put(`/customers/${c.id}`, body)
+    else await post('/customers', body)
+    m.close()
+    toast('Customer saved')
+    await onSaved()
+  }))
+}
+
+function customerPaymentDialog(customer, onSaved) {
+  const m = modal(`<form id="cpayf"><h2>Record payment — ${esc(customer.name)}</h2>
+    ${customer.balance != null ? `<p class="muted">Currently owed ${rs(customer.balance)}</p>` : ''}
+    <div class="grid">
+      <label class="field">Amount (Rs) *<input name="amount" inputmode="decimal" required></label>
+      <label class="field">Method<select name="method">
+        <option value="cash">Cash (office)</option><option value="bank">Bank transfer</option><option value="cheque">Cheque</option><option value="till">Into my till</option></select></label>
+      <label class="field">Reference<input name="reference"></label>
+      <label class="field">Date<input name="paid_on" type="date" value="${today()}"></label></div>
+    <label class="field" style="margin-top:10px">Note<input name="note"></label>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save payment</button></div></form>`)
+  $('#cpayf', m.el).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    const d = formData(e.target)
+    const amount = paisaOrNull(d.amount)
+    if (!amount || amount <= 0) throw new Error('Enter the amount paid')
+    await post(`/customers/${customer.id}/payments`, { ...d, amount })
+    m.close()
+    toast(`Payment of ${rs(amount)} recorded`)
+    await onSaved()
+  }))
+}
+
+async function customerLedgerView(view, id) {
+  const f = { from: '', to: today() }
+  view.innerHTML = `<div class="stack">
+    <div class="row"><a href="#/customers" class="link with-icon">${icon('arrow-left')} Customers</a></div>
+    <div class="row"><h1 id="cname">Customer</h1><div class="spacer"></div>
+      <button id="pay">Record payment</button><button id="edit">Edit</button></div>
+    <div class="row"><label class="field">From<input type="date" id="f-from"></label><label class="field">To<input type="date" id="f-to" value="${f.to}"></label></div>
+    <div class="panel table-wrap" id="ledger"></div></div>`
+  let customer
+  const load = async () => {
+    customer = (await get(`/customers/${id}`))
+    $('#cname', view).textContent = customer.name
+    const from = $('#f-from', view).value, to = $('#f-to', view).value
+    const data = await get(`/customers/${id}/ledger?${from ? `from=${from}&` : ''}${to ? `to=${to}` : ''}`)
+    $('#ledger', view).innerHTML = `<table><thead><tr><th>Date</th><th>Type</th><th>Description</th><th class="num">Debit</th><th class="num">Credit</th><th class="num">Balance</th></tr></thead>
+      <tbody>${data.entries.map((e) => `<tr><td>${esc(e.date)}</td><td>${esc(LEDGER_TYPES[e.type] || e.type)}</td><td>${esc(e.description)}</td>
+        <td class="num">${e.debit ? rs(e.debit) : ''}</td><td class="num">${e.credit ? rs(e.credit) : ''}</td><td class="num">${rs(e.balance)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="5">Balance owed</td><td class="num">${rs(data.balance)}</td></tr></tfoot></table>`
+  }
+  $('#pay', view).addEventListener('click', () => customerPaymentDialog(customer, load))
+  $('#edit', view).addEventListener('click', () => customerForm(customer, load))
+  $('#f-from', view).addEventListener('change', guard(load))
+  $('#f-to', view).addEventListener('change', guard(load))
+  await load()
+}
+
+// ---------- purchase orders ----------
+
+async function purchaseOrdersView(view) {
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Purchase orders</h1><div class="spacer"></div><button class="primary" id="add">New order</button></div>
+    <div class="panel table-wrap" id="list"></div></div>`
+  const load = async () => {
+    const rows = await get('/purchase-orders')
+    $('#list', view).innerHTML = rows.length === 0 ? '<p class="muted">No purchase orders yet.</p>' : `<table>
+      <thead><tr><th>#</th><th>Date</th><th>Supplier</th><th>Status</th><th class="num">Est. total</th></tr></thead>
+      <tbody>${rows.map((o) => `<tr class="clickable" data-id="${o.id}"><td>${o.id}</td><td>${esc(o.order_date)}</td><td>${esc(o.supplier_name)}</td>
+        <td><span class="badge ${o.status === 'received' ? 'ok' : o.status === 'cancelled' ? 'expired' : ''}">${esc(o.status)}</span></td>
+        <td class="num">${rs(o.total)}</td></tr>`).join('')}</tbody></table>`
+  }
+  $('#add', view).addEventListener('click', guard(() => purchaseOrderForm(null, load)))
+  $('#list', view).addEventListener('click', guard(async (e) => {
+    const tr = e.target.closest('tr[data-id]')
+    if (tr) purchaseOrderDetail(await get(`/purchase-orders/${tr.dataset.id}`), load)
+  }))
+  await load()
+}
+
+async function purchaseOrderForm(po, onSaved) {
+  const [suppliers, products] = await Promise.all([get('/suppliers'), get('/products/pick')])
+  const active = suppliers.filter((s) => s.active !== 0)
+  if (!active.length) {
+    toast('Add a supplier first', true)
+    location.hash = '#/suppliers'
+    return
+  }
+  const lines = po ? po.items.map((i) => ({ product: { id: i.product_id, name: i.product_name, strength: i.strength, form: i.form, pack_size: i.pack_size }, packs: i.packs, loose: i.loose_qty, pack_cost: i.pack_cost })) : []
+  const m = modal(`<form id="pof"><h2>${po ? `Edit order ${po.id}` : 'New purchase order'}</h2>
+    <div class="grid">
+      <label class="field">Supplier *<select name="supplier_id">${active.map((s) => `<option value="${s.id}" ${po && s.id === po.supplier_id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select></label>
+      <label class="field">Expected date<input name="expected_date" type="date" value="${esc(po?.expected_date || '')}"></label></div>
+    <label class="field">Notes<input name="notes" value="${esc(po?.notes || '')}"></label>
+    <div id="po-pick" style="margin-top:12px"></div>
+    <div class="table-wrap" style="margin-top:8px"><table><thead><tr><th>Item</th><th>Packs</th><th>Loose</th><th>Pack cost (Rs)</th><th class="num">Line total</th><th></th></tr></thead><tbody id="po-lines"></tbody></table></div>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save draft</button></div></form>`, { wide: true })
+  const tbody = $('#po-lines', m.el)
+  const render = () => {
+    tbody.innerHTML = lines.length === 0 ? '<tr><td colspan="6" class="muted">No items yet.</td></tr>' : lines.map((l, i) => `<tr>
+      <td>${esc(productLabel(l.product))}</td>
+      <td><input type="number" min="0" value="${l.packs}" data-packs="${i}" class="qty"></td>
+      <td><input type="number" min="0" value="${l.loose}" data-loose="${i}" class="qty"></td>
+      <td><input inputmode="decimal" value="${toRupees(l.pack_cost || 0)}" data-cost="${i}" class="w-money"></td>
+      <td class="num">${rs((l.packs * (l.product.pack_size || 1) + l.loose) * (l.pack_cost || 0) / (l.product.pack_size || 1))}</td>
+      <td><button type="button" class="link danger" data-rm="${i}">${icon('x')}</button></td></tr>`).join('')
+  }
+  $('#po-pick', m.el).appendChild(document.createElement('div'))
+  itemPicker($('#po-pick', m.el), (p) => {
+    const existing = lines.find((l) => l.product.id === p.id)
+    if (existing) existing.packs++
+    else lines.push({ product: p, packs: 1, loose: 0, pack_cost: p.pack_price || 0 })
+    render()
+  })
+  tbody.addEventListener('input', (e) => {
+    const { packs, loose, cost } = e.target.dataset
+    const i = packs ?? loose ?? cost
+    if (i === undefined) return
+    const l = lines[i]
+    if (packs !== undefined) l.packs = Math.max(0, Math.floor(Number(e.target.value)) || 0)
+    else if (loose !== undefined) l.loose = Math.max(0, Math.floor(Number(e.target.value)) || 0)
+    else l.pack_cost = paisaOrNull(e.target.value) || 0
+    render()
+  })
+  tbody.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-rm]')
+    if (b) { lines.splice(Number(b.dataset.rm), 1); render() }
+  })
+  $('#pof', m.el).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    if (!lines.length) throw new Error('Add at least one item')
+    const d = formData(e.target)
+    const items = lines.map((l) => ({ product_id: l.product.id, packs: l.packs, loose_qty: l.loose, pack_size: l.product.pack_size || 1, pack_cost: l.pack_cost }))
+    if (po) await put(`/purchase-orders/${po.id}`, { expected_date: d.expected_date || null, notes: d.notes, items })
+    else await post('/purchase-orders', { supplier_id: Number(d.supplier_id), expected_date: d.expected_date || null, notes: d.notes, items })
+    m.close()
+    toast('Purchase order saved')
+    await onSaved()
+  }))
+  render()
+}
+
+function purchaseOrderDetail(po, onSaved) {
+  const m = modal(`<h2>Order ${po.id} — ${esc(po.supplier_name)} <span class="badge">${esc(po.status)}</span></h2>
+    <p class="muted">${po.expected_date ? `Expected ${esc(po.expected_date)} · ` : ''}by ${esc(po.user_name)}${po.received_invoice_no ? ` · received as purchase ${esc(po.received_invoice_no)}` : ''}</p>
+    <div class="table-wrap"><table><thead><tr><th>Item</th><th class="num">Packs</th><th class="num">Loose</th><th class="num">Pack cost</th><th class="num">Line total</th></tr></thead>
+      <tbody>${po.items.map((i) => `<tr><td>${esc(i.product_name)} ${esc(i.strength || '')}</td><td class="num">${i.packs}</td><td class="num">${i.loose_qty || ''}</td>
+        <td class="num">${rs(i.pack_cost)}</td><td class="num">${rs(i.line_total)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="4">Est. total</td><td class="num">${rs(po.total)}</td></tr></tfoot></table></div>
+    <div class="actions">
+      <button data-close>Close</button>
+      ${po.status === 'draft' ? `<button id="po-edit">Edit</button><button id="po-cancel">Cancel order</button><button class="primary" id="po-send">Mark as sent</button>` : ''}
+      ${po.status === 'sent' ? `<button id="po-draft">Back to draft</button><button id="po-cancel">Cancel order</button><button class="primary" id="po-receive">Receive stock</button>` : ''}
+      ${po.status === 'cancelled' ? '<button id="po-draft">Reopen as draft</button>' : ''}
+    </div>`, { wide: true })
+  const setStatus = (status) => guard(async () => {
+    await post(`/purchase-orders/${po.id}/status`, { status })
+    m.close()
+    toast(`Order marked ${status}`)
+    await onSaved()
+  })
+  $('#po-send', m.el)?.addEventListener('click', setStatus('sent'))
+  $('#po-cancel', m.el)?.addEventListener('click', setStatus('cancelled'))
+  $('#po-draft', m.el)?.addEventListener('click', setStatus('draft'))
+  $('#po-edit', m.el)?.addEventListener('click', () => { m.close(); purchaseOrderForm(po, onSaved) })
+  $('#po-receive', m.el)?.addEventListener('click', () => { m.close(); location.hash = `#/purchases?po=${po.id}` })
+}
+
+// ---------- stock transfers ----------
+
+async function transfersView(view) {
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Stock transfers</h1><div class="spacer"></div><button id="locs">Locations</button><button class="primary" id="add">New transfer</button></div>
+    <div class="panel table-wrap" id="list"></div>
+    <p class="muted" style="font-size:13px">Sending stock marks it gone from this pharmacy's shelf right away. "Receive" just confirms the other site got it — it does not yet give that site its own sellable stock.</p></div>`
+  const load = async () => {
+    const rows = await get('/transfers')
+    $('#list', view).innerHTML = rows.length === 0 ? '<p class="muted">No transfers yet.</p>' : `<table>
+      <thead><tr><th>#</th><th>Date</th><th>To</th><th>Status</th><th class="num">Cost value</th></tr></thead>
+      <tbody>${rows.map((t) => `<tr class="clickable" data-id="${t.id}"><td>${esc(t.transfer_no)}</td><td>${esc(t.created_at)}</td><td>${esc(t.location_name)}</td>
+        <td><span class="badge ${t.status === 'received' ? 'ok' : t.status === 'cancelled' ? 'expired' : ''}">${esc(t.status)}</span></td>
+        <td class="num">${rs(t.total_cost)}</td></tr>`).join('')}</tbody></table>`
+  }
+  $('#add', view).addEventListener('click', guard(() => transferForm(load)))
+  $('#locs', view).addEventListener('click', guard(() => locationsDialog()))
+  $('#list', view).addEventListener('click', guard(async (e) => {
+    const tr = e.target.closest('tr[data-id]')
+    if (tr) transferDetail(await get(`/transfers/${tr.dataset.id}`), load)
+  }))
+  await load()
+}
+
+function locationsDialog() {
+  const m = modal(`<h2>Locations</h2><div class="panel table-wrap" id="loc-list"></div>
+    <form id="loc-add" class="row" style="margin-top:10px"><input name="name" placeholder="New location name" required style="flex:1"><button class="primary">Add</button></form>
+    <div class="actions"><button data-close>Close</button></div>`, { wide: true })
+  const load = async () => {
+    const rows = await get('/transfers/locations')
+    $('#loc-list', m.el).innerHTML = `<table><thead><tr><th>Name</th><th>Address</th><th>Status</th><th></th></tr></thead>
+      <tbody>${rows.map((l) => `<tr><td>${esc(l.name)}</td><td>${esc(l.address || '')}</td><td>${l.active ? 'Active' : 'Inactive'}</td>
+        <td><button type="button" class="link" data-tgl="${l.id}" data-on="${l.active}">${l.active ? 'Deactivate' : 'Activate'}</button></td></tr>`).join('')}</tbody></table>`
+  }
+  $('#loc-add', m.el).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    await post('/transfers/locations', formData(e.target))
+    e.target.reset()
+    await load()
+  }))
+  $('#loc-list', m.el).addEventListener('click', guard(async (e) => {
+    const b = e.target.closest('[data-tgl]')
+    if (!b) return
+    await put(`/transfers/locations/${b.dataset.tgl}`, { active: b.dataset.on === '1' ? 0 : 1 })
+    await load()
+  }))
+  load()
+}
+
+async function transferForm(onSaved) {
+  const locations = (await get('/transfers/locations')).filter((l) => l.active)
+  if (!locations.length) {
+    toast('Add a location first', true)
+    locationsDialog()
+    return
+  }
+  const lines = []
+  const m = modal(`<form id="trf"><h2>New stock transfer</h2>
+    <div class="grid"><label class="field">To *<select name="to_location_id">${locations.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join('')}</select></label>
+      <label class="field">Note<input name="notes"></label></div>
+    <div id="tr-pick" style="margin-top:12px"></div><div id="tr-lines" style="margin-top:8px"></div>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Send</button></div></form>`, { wide: true })
+  const grid = qtyGrid($('#tr-lines', m.el), lines, { checkStock: true })
+  grid.render()
+  itemPicker($('#tr-pick', m.el), (p) => grid.add(p))
+  $('#trf', m.el).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    if (!lines.length) throw new Error('Add at least one item')
+    const d = formData(e.target)
+    const items = lines.map((l) => ({ product_id: l.product.id, qty: lineUnits(l) }))
+    await post('/transfers', { to_location_id: Number(d.to_location_id), notes: d.notes, items })
+    m.close()
+    toast('Transfer sent')
+    await onSaved()
+  }))
+}
+
+function transferDetail(t, onSaved) {
+  const m = modal(`<h2>${esc(t.transfer_no)} — ${esc(t.location_name)} <span class="badge">${esc(t.status)}</span></h2>
+    <p class="muted">Sent ${esc(t.created_at)} by ${esc(t.sent_by)}${t.received_at ? ` · received ${esc(t.received_at)} by ${esc(t.received_by_name)}` : ''}${t.notes ? ` · ${esc(t.notes)}` : ''}</p>
+    <div class="table-wrap"><table><thead><tr><th>Item</th><th>Batch</th><th class="num">Qty</th><th class="num">Cost value</th></tr></thead>
+      <tbody>${t.items.map((i) => `<tr><td>${esc(i.product_name)} ${esc(i.strength || '')}</td><td>${esc(i.batch_no)}</td><td class="num">${i.qty}</td><td class="num">${rs(i.line_total)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="3">Total cost</td><td class="num">${rs(t.total_cost)}</td></tr></tfoot></table></div>
+    <div class="actions"><button data-close>Close</button>
+      ${t.status === 'sent' ? '<button id="t-cancel">Undo (put stock back)</button><button class="primary" id="t-receive">Mark received</button>' : ''}</div>`, { wide: true })
+  $('#t-receive', m.el)?.addEventListener('click', guard(async () => {
+    await post(`/transfers/${t.id}/receive`)
+    m.close()
+    toast('Transfer marked received')
+    await onSaved()
+  }))
+  $('#t-cancel', m.el)?.addEventListener('click', guard(async () => {
+    await post(`/transfers/${t.id}/cancel`)
+    m.close()
+    toast('Transfer cancelled, stock restored')
+    await onSaved()
+  }))
+}
+
+// ---------- employees ----------
+
+async function employeesView(view) {
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Employees</h1><div class="spacer"></div>
+      <label class="row" style="font-size:13px"><input type="checkbox" id="inactive"> Show inactive</label>
+      <button class="primary" id="add">Add employee</button></div>
+    <div class="panel table-wrap" id="list"></div></div>`
+  let rows = []
+  const load = async () => {
+    rows = await get('/employees')
+    const shown = $('#inactive', view).checked ? rows : rows.filter((e) => e.active !== 0)
+    $('#list', view).innerHTML = shown.length === 0 ? '<p class="muted">No employee records yet.</p>' : `<table>
+      <thead><tr><th>Name</th><th>Job title</th><th>Phone</th><th>Linked login</th><th>Hired</th></tr></thead>
+      <tbody>${shown.map((e) => `<tr class="clickable" data-id="${e.id}"><td>${esc(e.full_name)} ${e.active === 0 ? '<span class="muted">(inactive)</span>' : ''}</td>
+        <td>${esc(e.job_title || '')}</td><td>${esc(e.phone || '')}</td><td>${e.username ? `${esc(e.username)} (${esc(e.role)})` : '<span class="muted">—</span>'}</td>
+        <td>${esc(e.hire_date || '')}</td></tr>`).join('')}</tbody></table>`
+  }
+  $('#add', view).addEventListener('click', guard(() => employeeForm(null, load)))
+  $('#inactive', view).addEventListener('change', guard(load))
+  $('#list', view).addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-id]')
+    const emp = tr && rows.find((x) => x.id === Number(tr.dataset.id))
+    if (emp) employeeForm(emp, load)
+  })
+  await load()
+}
+
+async function employeeForm(e, onSaved) {
+  const users = await get('/users')
+  const taken = new Set((await get('/employees')).filter((x) => x.user_id && x.id !== e?.id).map((x) => x.user_id))
+  const v = e || { active: 1, salary: 0 }
+  const m = modal(`<form id="ef"><h2>${e ? 'Edit' : 'Add'} employee</h2><div class="grid">
+    <label class="field">Full name *<input name="full_name" value="${esc(v.full_name)}" required></label>
+    <label class="field">Job title<input name="job_title" value="${esc(v.job_title)}"></label>
+    <label class="field">Phone<input name="phone" value="${esc(v.phone)}"></label>
+    <label class="field">CNIC<input name="cnic" value="${esc(v.cnic)}"></label>
+    <label class="field">Address<input name="address" value="${esc(v.address)}"></label>
+    <label class="field">Hire date<input name="hire_date" type="date" value="${esc(v.hire_date || '')}"></label>
+    <label class="field">Salary (Rs/month)<input name="salary" inputmode="decimal" value="${toRupees(v.salary || 0)}"></label>
+    <label class="field">Linked login (optional)<select name="user_id"><option value="">None</option>
+      ${users.filter((u) => !taken.has(u.id) || u.id === v.user_id).map((u) => `<option value="${u.id}" ${u.id === v.user_id ? 'selected' : ''}>${esc(u.full_name)} (${esc(u.username)})</option>`).join('')}</select></label>
+    <label class="field">Emergency contact<input name="emergency_contact_name" value="${esc(v.emergency_contact_name)}"></label>
+    <label class="field">Emergency phone<input name="emergency_contact_phone" value="${esc(v.emergency_contact_phone)}"></label>
+    </div>
+    <label class="field">Notes<textarea name="notes" rows="2">${esc(v.notes)}</textarea></label>
+    <label class="row" style="margin-top:10px"><input type="checkbox" name="active" ${v.active !== 0 ? 'checked' : ''}> Active</label>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`, { wide: true })
+  $('#ef', m.el).addEventListener('submit', guard(async (ev) => {
+    ev.preventDefault()
+    const d = formData(ev.target)
+    const salary = d.salary.trim() === '' ? 0 : paisaOrNull(d.salary)
+    if (salary === null) throw new Error('Enter a valid salary')
+    const body = { ...d, salary, user_id: d.user_id || null }
+    if (e) await put(`/employees/${e.id}`, body)
+    else await post('/employees', body)
+    m.close()
+    toast('Employee saved')
+    await onSaved()
+  }))
+}
+
+// ---------- appointments ----------
+
+const toStamp = (dtLocal) => (dtLocal ? `${dtLocal.replace('T', ' ')}:00` : '')
+const toDtLocal = (stamp) => (stamp ? stamp.slice(0, 16).replace(' ', 'T') : '')
+const APPT_KINDS = { consultation: 'Consultation', shift: 'Shift', other: 'Other' }
+
+async function appointmentsView(view) {
+  const manageAll = hasPerm('calendar.manage_all')
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>${manageAll ? 'Appointments & shifts' : 'My appointments'}</h1><div class="spacer"></div><button class="primary" id="add">New</button></div>
+    <div class="panel table-wrap" id="list"></div></div>`
+  let rows = []
+  const load = async () => {
+    rows = await get(`/appointments?from=${encodeURIComponent(`${today()} 00:00:00`)}`)
+    $('#list', view).innerHTML = rows.length === 0 ? '<p class="muted">Nothing scheduled.</p>' : `<table>
+      <thead><tr><th>Start</th><th>End</th><th>Title</th><th>Kind</th>${manageAll ? '<th>With</th>' : ''}<th>Customer</th><th></th></tr></thead>
+      <tbody>${rows.map((a) => `<tr><td>${esc(a.starts_at)}</td><td>${esc(a.ends_at)}</td><td>${esc(a.title)}</td><td>${esc(APPT_KINDS[a.kind] || a.kind)}</td>
+        ${manageAll ? `<td>${esc(a.with_name)}</td>` : ''}<td>${esc(a.customer_name || '')}</td>
+        <td><button type="button" class="link danger" data-cancel="${a.id}">Cancel</button></td></tr>`).join('')}</tbody></table>`
+  }
+  $('#add', view).addEventListener('click', guard(() => appointmentForm(load, manageAll)))
+  $('#list', view).addEventListener('click', guard(async (e) => {
+    const b = e.target.closest('[data-cancel]')
+    if (!b) return
+    if (!confirm('Cancel this appointment?')) return
+    await post(`/appointments/${b.dataset.cancel}/cancel`)
+    toast('Appointment cancelled')
+    await load()
+  }))
+  await load()
+}
+
+async function appointmentForm(onSaved, manageAll) {
+  const staff = manageAll ? await get('/users') : []
+  const m = modal(`<form id="apf"><h2>New appointment</h2><div class="grid">
+    <label class="field">Title *<input name="title" required></label>
+    <label class="field">Kind<select name="kind">${Object.entries(APPT_KINDS).map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}</select></label>
+    <label class="field">Start *<input name="starts_at" type="datetime-local" required></label>
+    <label class="field">End *<input name="ends_at" type="datetime-local" required></label>
+    ${manageAll ? `<label class="field">With<select name="with_user_id">${staff.filter((u) => u.active).map((u) => `<option value="${u.id}">${esc(u.full_name)}</option>`).join('')}</select></label>` : ''}
+    </div>
+    <label class="field">Notes<input name="notes"></label>
+    <div class="actions"><button type="button" data-close>Cancel</button><button class="primary">Save</button></div></form>`, { wide: true })
+  $('#apf', m.el).addEventListener('submit', guard(async (e) => {
+    e.preventDefault()
+    const d = formData(e.target)
+    await post('/appointments', {
+      title: d.title, kind: d.kind, starts_at: toStamp(d.starts_at), ends_at: toStamp(d.ends_at), notes: d.notes,
+      ...(manageAll && d.with_user_id ? { with_user_id: Number(d.with_user_id) } : {}),
+    })
+    m.close()
+    toast('Appointment booked')
+    await onSaved()
+  }))
+}
+
+// ---------- messages ----------
+
+async function messagesView(view) {
+  view.innerHTML = `<div class="stack">
+    <h1>Messages</h1>
+    <div class="row" style="align-items:flex-start;gap:16px">
+      <div class="panel" style="flex:0 0 260px"><div id="threads"></div>
+        <form id="new-msg" style="margin-top:10px"><select name="to_user_id" style="width:100%;margin-bottom:6px"></select>
+          <button type="button" class="link" id="start-thread">Start a new conversation</button></form></div>
+      <div class="panel stack" style="flex:1" id="conv"><p class="muted">Pick a conversation.</p></div>
+    </div></div>`
+  let active = null
+  const loadThreads = async () => {
+    const threads = await get('/messages/threads')
+    $('#threads', view).innerHTML = threads.length === 0 ? '<p class="muted">No messages yet.</p>' : threads.map((t) => `
+      <button type="button" class="link thread-row ${t.user_id === active ? 'sel' : ''}" data-open="${t.user_id}" style="display:block;width:100%;text-align:left;padding:6px 0">
+        <b>${esc(t.user_name)}</b>${t.unread ? ` <span class="badge warn">${t.unread}</span>` : ''}<div class="muted small">${esc(t.last_body).slice(0, 40)}</div></button>`).join('')
+    const contacts = await get('/messages/contacts')
+    $('[name=to_user_id]', view).innerHTML = contacts.map((c) => `<option value="${c.id}">${esc(c.full_name)} (${esc(c.role)})</option>`).join('')
+  }
+  const openThread = async (userId) => {
+    active = userId
+    const msgs = await get(`/messages/with/${userId}`)
+    const me = state.user.id
+    $('#conv', view).innerHTML = `<div id="msgs" style="max-height:420px;overflow-y:auto">${msgs.map((m) => `
+      <div style="margin:4px 0;text-align:${m.from_user_id === me ? 'right' : 'left'}"><span class="badge" style="background:var(--${m.from_user_id === me ? 'accent-soft' : 'panel'})">${esc(m.body)}</span>
+        <div class="muted" style="font-size:11px">${esc(m.created_at)}</div></div>`).join('') || '<p class="muted">No messages yet.</p>'}</div>
+      <form id="reply" class="row" style="margin-top:10px"><input name="body" placeholder="Type a message" style="flex:1" required><button class="primary">Send</button></form>`
+    $('#reply', view).addEventListener('submit', guard(async (e) => {
+      e.preventDefault()
+      const d = formData(e.target)
+      await post('/messages', { to_user_id: userId, body: d.body })
+      e.target.reset()
+      await openThread(userId)
+      await loadThreads()
+    }))
+    await loadThreads()
+  }
+  $('#threads', view).addEventListener('click', guard(async (e) => {
+    const b = e.target.closest('[data-open]')
+    if (b) await openThread(Number(b.dataset.open))
+  }))
+  $('#start-thread', view).addEventListener('click', guard(async () => {
+    const id = Number($('[name=to_user_id]', view).value)
+    if (id) await openThread(id)
+  }))
+  await loadThreads()
+}
+
+// ---------- knowledge ----------
+
+async function knowledgeView(view) {
+  const canManage = hasPerm('knowledge.manage')
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Knowledge</h1><div class="spacer"></div>
+      <input id="search" placeholder="Search articles" style="max-width:260px">
+      ${canManage ? '<button class="primary" id="add">New article</button>' : ''}</div>
+    <div class="panel table-wrap" id="list"></div></div>`
+  const load = async (q = '') => {
+    const rows = await get(`/knowledge${q ? `?q=${encodeURIComponent(q)}` : ''}`)
+    $('#list', view).innerHTML = rows.length === 0 ? '<p class="muted">No articles yet.</p>' : `<table>
+      <thead><tr><th>Title</th><th>Tags</th><th>By</th><th>Updated</th></tr></thead>
+      <tbody>${rows.map((a) => `<tr class="clickable" data-id="${a.id}"><td>${esc(a.title)}</td>
+        <td>${(a.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join(' ')}</td>
+        <td>${esc(a.author_name)}</td><td>${esc(a.updated_at)}</td></tr>`).join('')}</tbody></table>`
+  }
+  $('#add', view)?.addEventListener('click', guard(() => articleForm(null, load, canManage)))
+  $('#search', view).addEventListener('input', guard((e) => load(e.target.value.trim())))
+  $('#list', view).addEventListener('click', guard(async (e) => {
+    const tr = e.target.closest('tr[data-id]')
+    if (tr) articleForm(await get(`/knowledge/${tr.dataset.id}`), load, canManage)
+  }))
+  await load()
+}
+
+function articleForm(a, onSaved, canManage) {
+  const readOnly = !canManage
+  const m = modal(`<form id="kf"><h2>${a ? esc(a.title) : 'New article'}</h2><div class="grid">
+    <label class="field">Title *<input name="title" value="${esc(a?.title)}" required ${readOnly ? 'readonly' : ''}></label>
+    <label class="field">Tags (comma separated)<input name="tags" value="${esc((a?.tags || []).join(', '))}" ${readOnly ? 'readonly' : ''}></label></div>
+    <label class="field">Body<textarea name="body" rows="14" ${readOnly ? 'readonly' : ''}>${esc(a?.body)}</textarea></label>
+    <div class="actions"><button type="button" data-close>Close</button>${canManage ? '<button class="primary">Save</button>' : ''}</div></form>`, { wide: true })
+  if (canManage) {
+    $('#kf', m.el).addEventListener('submit', guard(async (e) => {
+      e.preventDefault()
+      const d = formData(e.target)
+      if (a) await put(`/knowledge/${a.id}`, d)
+      else await post('/knowledge', d)
+      m.close()
+      toast('Article saved')
+      await onSaved()
+    }))
+  } else {
+    $('#kf', m.el).addEventListener('submit', (e) => e.preventDefault())
+  }
+}
+
+// ---------- analytics (BI dashboards) ----------
+
+// A trend bar chart for any date range (salesChartHtml is fixed at 7 days with "today" highlighted;
+// this is the same accessible hit-overlay/tooltip technique, generalised for the Analytics screen).
+function trendChartHtml(series, title) {
+  const max = Math.max(...series.map((d) => d.total), 0)
+  const n = Math.max(series.length, 1)
+  const H = 140
+  const bars = series.map((d, i) => {
+    const h = max ? Math.max(d.total > 0 ? 2 : 0, Math.round((d.total / max) * (H - 4))) : 0
+    return h ? `<rect x="${(i + 0.15) * (100 / n)}%" y="${H - h}" width="${0.7 * (100 / n)}%" height="${h}" rx="2"></rect>` : ''
+  }).join('')
+  const label = (d) => `${dayLabel(d.day, { day: 'numeric', month: 'short' })}: ${rs(d.total)}, ${plural(d.invoices, 'invoice')}`
+  return `<figure class="chart" aria-labelledby="trend-title">
+    <figcaption class="row"><h2 id="trend-title" style="margin:0">${esc(title)}</h2></figcaption>
+    <div class="chart-plot" style="height:${H}px">
+      <svg viewBox="0 0 100 ${H}" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <line x1="0" y1="${H - 0.5}" x2="100" y2="${H - 0.5}" class="axis" vector-effect="non-scaling-stroke"></line>${bars}
+      </svg>
+      <div class="chart-hits" style="grid-template-columns:repeat(${n},1fr)">${series.map((d) => `<span tabindex="0" role="img" aria-label="${esc(label(d))}" data-tip="${esc(label(d))}"></span>`).join('')}</div>
+      ${max ? '' : '<div class="chart-empty muted">No sales in this range</div>'}
+      <div class="chart-tip" hidden></div>
+    </div>
+  </figure>`
+}
+
+function hBarChartHtml(title, items, { labelFmt, valueFmt = rs } = {}) {
+  const max = Math.max(...items.map((i) => i.value), 0)
+  return `<h2>${esc(title)}</h2>${items.length === 0 ? '<p class="muted">Nothing in this range.</p>' : items.map((i) => `
+    <div class="hbar-row"><span class="label">${esc(labelFmt ? labelFmt(i) : i.label)}</span><span class="value">${esc(valueFmt(i.value))}</span>
+      <div class="hbar-track"><div class="hbar-fill" style="width:${max ? Math.round((i.value / max) * 100) : 0}%"></div></div></div>`).join('')}`
+}
+
+const DONUT_COLORS = ['var(--accent)', 'var(--rx)', 'var(--warn)', 'var(--danger)', 'var(--muted)']
+
+function donutChartHtml(title, items, { labelFmt, valueFmt = rs } = {}) {
+  const total = items.reduce((s, i) => s + i.value, 0)
+  let offset = 0
+  const R = 15.9155 // circumference ~= 100, so stroke-dasharray can be in percent directly
+  const circles = items.map((i, idx) => {
+    const pct = total ? (i.value / total) * 100 : 0
+    const c = `<circle cx="18" cy="18" r="${R}" fill="none" stroke="${DONUT_COLORS[idx % DONUT_COLORS.length]}" stroke-width="5"
+      stroke-dasharray="${pct} ${100 - pct}" stroke-dashoffset="${25 - offset}"></circle>`
+    offset += pct
+    return c
+  }).join('')
+  return `<h2>${esc(title)}</h2><div class="donut-wrap">
+    <svg viewBox="0 0 36 36" width="140" height="140" aria-hidden="true">${circles || '<circle cx="18" cy="18" r="' + R + '" fill="none" stroke="var(--border)" stroke-width="5"></circle>'}</svg>
+    <div class="donut-legend">${items.length === 0 ? '<span class="muted">No data in this range.</span>' : items.map((i, idx) => `
+      <span><span class="sw" style="background:${DONUT_COLORS[idx % DONUT_COLORS.length]}"></span>${esc(labelFmt ? labelFmt(i) : i.label)} — ${esc(valueFmt(i.value))}${total ? ` (${Math.round((i.value / total) * 100)}%)` : ''}</span>`).join('')}</div>
+  </div>`
+}
+
+const PAYMENT_LABELS = { cash: 'Cash', card: 'Card', wallet: 'JazzCash / Easypaisa', account: 'Account' }
+
+async function analyticsView(view) {
+  const range = { from: daysAgo(29), to: today() }
+  view.innerHTML = `<div class="stack">
+    <div class="row"><h1>Analytics</h1><div class="spacer"></div>
+      <label class="field">From<input type="date" id="f-from" value="${range.from}"></label>
+      <label class="field">To<input type="date" id="f-to" value="${range.to}"></label></div>
+    <div class="dash-grid" id="body"><p class="muted">Loading…</p></div></div>`
+  const load = async () => {
+    const from = $('#f-from', view).value, to = $('#f-to', view).value
+    const [summary, topProducts] = await Promise.all([
+      get(`/reports/summary?from=${from}&to=${to}`), get(`/reports/top-products?from=${from}&to=${to}`),
+    ])
+    $('#body', view).innerHTML = `
+      <div class="panel wide dash-cards cards">
+        <div class="card"><div class="muted">Net sales</div><div class="value">${rs(summary.net_sales)}</div></div>
+        <div class="card"><div class="muted">Invoices</div><div class="value">${summary.sales.invoices.toLocaleString('en-PK')}</div></div>
+        <div class="card"><div class="muted">Gross profit</div><div class="value">${rs(summary.gross_profit)}</div></div>
+        <div class="card"><div class="muted">Returns</div><div class="value">${rs(summary.returns.total)}</div></div>
+      </div>
+      <div class="panel wide">${trendChartHtml(summary.byDay, 'Sales by day')}</div>
+      <div class="panel">${hBarChartHtml('Top products by revenue', topProducts.slice(0, 8).map((p) => ({ label: `${p.name}${p.strength ? ` ${p.strength}` : ''}`, value: p.revenue })))}</div>
+      <div class="panel">${donutChartHtml('By payment method', summary.byPayment.map((b) => ({ label: PAYMENT_LABELS[b.payment_method] || b.payment_method, value: b.total })))}</div>`
+    bindChart($('#body', view))
+  }
+  $('#f-from', view).addEventListener('change', guard(load))
+  $('#f-to', view).addEventListener('change', guard(load))
   await load()
 }
 

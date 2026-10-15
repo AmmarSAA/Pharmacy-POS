@@ -285,4 +285,19 @@ nav.side .net:empty { display: none; }
 .search-box { position: relative; }
 .search-box .scan-btn { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); padding: 6px 8px; }
 details.panel > summary { cursor: pointer; padding: 2px 0; }
+
+/* Roles: permission checkboxes grouped by area */
+fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px 12px; margin: 0; }
+fieldset legend { padding: 0 6px; font-size: 13px; font-weight: 600; color: var(--muted); }
+fieldset label.row { padding: 3px 0; }
+
+/* Analytics: horizontal bars and a donut, alongside the existing .chart trend bars */
+.hbar-row { display: grid; grid-template-columns: minmax(0, 1fr) 60px; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
+.hbar-row .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hbar-track { grid-column: 1 / -1; height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; }
+.hbar-fill { height: 100%; background: var(--accent); border-radius: 4px; }
+.hbar-row .value { text-align: right; font-variant-numeric: tabular-nums; }
+.donut-wrap { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+.donut-legend { display: grid; gap: 6px; font-size: 13px; }
+.donut-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 details.panel[open] > summary { margin-bottom: 10px; }

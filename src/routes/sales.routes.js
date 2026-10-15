@@ -1,5 +1,5 @@
 import { Router } from '../lib/router.js'
-import { requireRole } from '../auth.js'
+import { requirePermission } from '../auth.js'
 import { today, nowStamp, getSettings } from '../db.js'
 import { escapeRegex } from './products.routes.js'
 import { addDays } from '../lib/supplier-ledger.js'
@@ -8,7 +8,7 @@ import { allocateFefo, moveStock } from '../lib/stock.js'
 import { percentOf, inclusiveTax, roundToRupee, packAmount } from '../lib/money.js'
 import { tillForCash } from '../lib/till.js'
 
-const PAYMENT_METHODS = ['cash', 'card', 'wallet']
+const PAYMENT_METHODS = ['cash', 'card', 'wallet', 'account']
 // Owner-set discount caps per role (settings max_discount_<role>_bps).
 const maxDiscountFor = (settings, role) => Number(settings[`max_discount_${role}_bps`] ?? 0)
 
@@ -90,6 +90,15 @@ export default function saleRoutes(db) {
     const maxDiscount = maxDiscountFor(settings, req.user.role)
     const onDate = offline ? offline.at.slice(0, 10) : today()
 
+    // A customer account: required to sell "on account", optional otherwise (for loyalty points).
+    const customerId = optInt(req.body, 'customer_id', null, { min: 1, label: 'Customer' })
+    const customer = customerId ? await db.get('customers', customerId) : null
+    if (customerId && (!customer || !customer.active)) throw badRequest('Customer not found')
+    if (paymentMethod === 'account' && !customer) throw badRequest('Choose a customer account to sell on account')
+    const redeemPoints = optInt(req.body, 'redeem_points', 0, { min: 0, label: 'Points to redeem' })
+    if (redeemPoints > 0 && !customer) throw badRequest('Choose a customer to redeem their points')
+    if (redeemPoints > 0 && redeemPoints > (customer?.loyalty_points || 0)) throw badRequest('Not that many points on this account')
+
     // Merge duplicate lines for the same product so FEFO allocation sees the full quantity.
     const cart = new Map()
     for (const [i, it] of items.entries()) {
@@ -130,6 +139,9 @@ export default function saleRoutes(db) {
     if (hasControlled && req.user.role === 'cashier') {
       throw new HttpError(403, 'Controlled drugs must be dispensed by a pharmacist')
     }
+    if (paymentMethod === 'account' && offline) {
+      throw new HttpError(409, 'Account sales cannot be made offline; the register must be kept online')
+    }
     const prescription = hasRx ? readPrescription(req.body, hasControlled) : null
     // Offline sales already happened: they go to the till that was open then (or none), never refused.
     const till = offline ? await tillAt(db, req.user.id, offline.at) : await tillForCash(db, req.user.id, settings, 'sell')
@@ -158,14 +170,28 @@ export default function saleRoutes(db) {
       const subtotal = lines.reduce((s, l) => s + l.gross, 0)
       const discount = lines.reduce((s, l) => s + l.discount, 0)
       const tax = lines.reduce((s, l) => s + l.tax, 0)
-      const net = subtotal - discount
+
+      // Loyalty points redeemed as a further, order-level discount (checked again here against the
+      // live balance, inside the transaction, in case it changed since the request started).
+      let loyaltyDiscount = 0
+      if (redeemPoints > 0) {
+        const live = await db.get('customers', customer.id)
+        if (redeemPoints > (live?.loyalty_points || 0)) throw new HttpError(409, 'Not that many points on this account')
+        loyaltyDiscount = Math.min(redeemPoints * Number(settings.loyalty_point_value_paisa || 100), subtotal - discount)
+      }
+
+      const net = subtotal - discount - loyaltyDiscount
       const total = settings.round_to_rupee === '1' ? roundToRupee(net) : net
       const roundOff = total - net
 
       let amountPaid = total
+      let changeDue = 0
       if (paymentMethod === 'cash') {
         amountPaid = reqInt({ v: req.body.amount_paid ?? total }, 'v', { min: 0, label: 'Amount paid' })
         if (amountPaid < total) throw badRequest('Amount paid is less than the total')
+        changeDue = amountPaid - total
+      } else if (paymentMethod === 'account') {
+        amountPaid = 0
       }
 
       let prescriptionId = null
@@ -177,13 +203,23 @@ export default function saleRoutes(db) {
       const stamp = offline ? offline.at : nowStamp()
       await db.col('sales').insertOne({
         _id: saleId, id: saleId, invoice_no: `INV-${String(saleId).padStart(6, '0')}`, user_id: req.user.id,
-        customer_name: optString(req.body, 'customer_name') || prescription?.patient_name || null,
-        customer_phone: optString(req.body, 'customer_phone') || prescription?.patient_phone || null,
-        prescription_id: prescriptionId, subtotal, discount, tax, round_off: roundOff, total, payment_method: paymentMethod,
-        amount_paid: amountPaid, change_due: amountPaid - total, till_session_id: till?.id ?? null, created_at: stamp,
+        customer_name: optString(req.body, 'customer_name') || customer?.name || prescription?.patient_name || null,
+        customer_phone: optString(req.body, 'customer_phone') || customer?.phone || prescription?.patient_phone || null,
+        customer_id: customer?.id ?? null,
+        account_due_date: paymentMethod === 'account' ? addDays(onDate, customer.due_days || 0) : null,
+        loyalty_redeemed: redeemPoints || 0, loyalty_discount: loyaltyDiscount,
+        prescription_id: prescriptionId, subtotal, discount: discount + loyaltyDiscount, tax, round_off: roundOff, total, payment_method: paymentMethod,
+        amount_paid: amountPaid, change_due: changeDue, till_session_id: till?.id ?? null, created_at: stamp,
         has_controlled: hasControlled ? 1 : 0,
         ...(offline && { offline_id: offline.id, synced_at: nowStamp() }),
       })
+
+      // Loyalty points: earned on the final total, minus any redeemed this sale.
+      if (customer) {
+        const earned = Math.floor(total / 10000) * Number(settings.loyalty_points_per_100rs || 1)
+        const delta = earned - redeemPoints
+        if (delta !== 0) await db.col('customers').updateOne({ _id: customer.id }, { $inc: { loyalty_points: delta } })
+      }
 
       let itemId = await db.reserveIds('sale_items', lines.length)
       const docs = lines.map((l) => {
@@ -248,17 +284,20 @@ export default function saleRoutes(db) {
   })
 
   // Body: { items: [{ sale_item_id, qty, restock? }], reason }
-  r.post('/:id/returns', requireRole('admin', 'pharmacist'), async (req, res) => {
+  r.post('/:id/returns', requirePermission('sales.returns'), async (req, res) => {
     const saleId = Number(req.params.id)
     const sale = await db.get('sales', saleId)
     if (!sale) throw notFound('Sale')
     const items = req.body.items
     if (!Array.isArray(items) || items.length === 0) throw badRequest('Choose at least one item to return')
     const reason = reqString(req.body, 'reason', 'Reason')
-    // Card/wallet sales go back to the card/wallet when the owner allows it; everything else is cash.
+    // An account sale is always credited back to the account (no cash ever changed hands at sale
+    // time). Otherwise, card/wallet sales go back to the card/wallet when the owner allows it;
+    // everything else is cash.
     const settings = await getSettings(db)
-    const refundMethod =
-      settings.refund_card_sales === 'original' && sale.payment_method !== 'cash' ? sale.payment_method : 'cash'
+    const refundMethod = sale.payment_method === 'account'
+      ? 'account'
+      : settings.refund_card_sales === 'original' && sale.payment_method !== 'cash' ? sale.payment_method : 'cash'
     const till = refundMethod === 'cash' ? await tillForCash(db, req.user.id, settings, 'refund') : null
 
     await db.tx(async () => {
