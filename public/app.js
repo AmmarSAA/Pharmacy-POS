@@ -1027,8 +1027,8 @@ function posView(view) {
           ${pos.account
             ? `Account: <b>${esc(pos.account.name)}</b> (${pos.account.loyalty_points || 0} points)
                <button type="button" class="link" id="acct-clear">change</button>`
-            : `<input id="acct-search" placeholder="Link a customer account (optional, for billing to account or loyalty points)" autocomplete="off">
-               <div class="results" id="acct-results" hidden></div>`}
+            : `<div class="search-box"><input id="acct-search" placeholder="Link a customer account (optional, for billing to account or loyalty points)" autocomplete="off">
+               <div class="results" id="acct-results" hidden></div></div>`}
         </div>
         ${pos.account && pos.account.loyalty_points > 0 ? `<label class="field">Redeem points (has ${pos.account.loyalty_points})
           <input id="redeem" type="number" min="0" max="${pos.account.loyalty_points}" value="${esc(pos.redeemPoints)}"></label>` : ''}
@@ -1830,7 +1830,7 @@ async function purchaseForm(onSaved, fromPO = null) {
       <tbody id="lines">${fromPO
         ? fromPO.items.map((i) => {
             const p = byId.get(i.product_id)
-            return purchaseRowHtml({ product: p ? `${productLabel(p)} #${p.id}` : '', packs: i.packs, loose_qty: i.loose_qty, pack_cost: i.pack_cost })
+            return purchaseRowHtml({ product: p ? `${productLabel(p)} #${p.id}` : '', packs: i.packs, loose_qty: i.loose_qty, pack_cost: toRupees(i.pack_cost) })
           }).join('')
         : purchaseRowHtml()}</tbody></table></div>
     <button type="button" class="link" id="addline">+ Add row</button>
