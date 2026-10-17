@@ -60,9 +60,12 @@ export async function mountAssistant(ctx) {
   current = createPanel(ctx, status)
 }
 
-// Escape first, then a small safe subset of markdown: **bold**, `code`, bullet lists, paragraphs.
+// Escape first, then a small safe subset of markdown: **bold**, `code`, [label](#/link) bullet lists,
+// paragraphs. Links are restricted to this app's own hash routes (e.g. from find_tutorial), never a
+// bare http(s) URL, so the assistant can never get the user to click through to somewhere else.
 function richText(esc, text) {
   const inline = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]]+)\]\((#\/[^)\s]*)\)/g, '<a href="$2">$1</a>')
   const out = []
   let list = null
   for (const raw of String(text || '').split('\n')) {

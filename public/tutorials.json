@@ -1,0 +1,45 @@
+{
+  "tutorials": [
+    { "id": "01-getting-started", "title": "Getting started", "summary": "A tour of the dashboard, the menu and where everything lives." },
+    { "id": "02-making-a-sale", "title": "Making a sale", "summary": "Scan or search a medicine, take payment, print the receipt and handle a return." },
+    { "id": "03-purchases-and-orders", "title": "Purchases & purchase orders", "summary": "Receive stock from a supplier, and raise a purchase order first." },
+    { "id": "04-customers-and-accounts", "title": "Customer accounts & loyalty", "summary": "Sell on account, take a payment against it, and earn or redeem loyalty points." },
+    { "id": "05-stock-transfers", "title": "Stock transfers", "summary": "Send stock to another location and acknowledge receipt." },
+    { "id": "06-departments-and-issues", "title": "Department requests & issues", "summary": "Record a ward's requisition and issue stock against it." },
+    { "id": "07-employees-and-appointments", "title": "Employees & appointments", "summary": "Keep staff records and book appointments on the calendar." },
+    { "id": "08-messages-knowledge-roles", "title": "Messages, knowledge base & roles", "summary": "Message a co-worker, write a knowledge article, and set up a custom role." },
+    { "id": "09-reports-and-analytics", "title": "Reports & analytics", "summary": "Sales summaries, stock value, expiry, dues and the business-intelligence dashboards." },
+    { "id": "10-ai-assistant", "title": "The AI assistant", "summary": "Ask it questions, have it make changes with your approval, and ask it for help." }
+  ],
+  "faq_topics": [
+    { "value": "sales", "label": "Sales & till" },
+    { "value": "purchases", "label": "Purchases" },
+    { "value": "customers", "label": "Customers" },
+    { "value": "stock", "label": "Stock" },
+    { "value": "hr", "label": "HR & scheduling" },
+    { "value": "collaboration", "label": "Collaboration" },
+    { "value": "reports", "label": "Reports" },
+    { "value": "assistant", "label": "Assistant" },
+    { "value": "setup", "label": "Setup" }
+  ],
+  "faq": [
+    { "topic": "sales", "video": "02-making-a-sale", "q": "How do I make a sale?", "a": "Open Point of sale, search or scan the medicine, set the quantity in packs or loose units, choose the payment method and confirm. The receipt is ready to print straight after." },
+    { "topic": "sales", "video": "02-making-a-sale", "q": "A prescription medicine needs more details. What do I enter?", "a": "When the cart has an Rx or controlled medicine, a prescription panel opens for the patient and prescriber's details. Controlled drugs also need the patient's CNIC and the prescriber's PMDC number, and can only be sold by a pharmacist." },
+    { "topic": "sales", "video": "02-making-a-sale", "q": "How do I refund part of a sale?", "a": "Open the sale from Sales & returns and choose Return against it. Pick the items and quantity being returned; stock goes back if the batch has not expired, and the refund follows the same rule as the sale (cash, or back to the original method if the owner allows it)." },
+    { "topic": "till", "video": "02-making-a-sale", "q": "Why does the POS screen ask me to open a till first?", "a": "Every cash sale is tied to a till session so the drawer can be counted and reconciled at the end of the shift. Open your till from the Till screen with the starting cash, and close it there too when you are done." },
+    { "topic": "purchases", "video": "03-purchases-and-orders", "q": "How do I receive new stock from a supplier?", "a": "Open Purchases → New purchase, choose the supplier, and for each medicine enter the batch number, expiry date, packs received and the pack cost. Saving creates the batch (or tops it up) and the stock is available to sell immediately." },
+    { "topic": "purchases", "video": "03-purchases-and-orders", "q": "What is a purchase order for, if it isn't stock yet?", "a": "A purchase order records what you've asked a supplier for before it arrives. Create it from Purchase orders, mark it Sent, and when the delivery comes, receive the purchase against that order so the two stay linked." },
+    { "topic": "customers", "video": "04-customers-and-accounts", "q": "How do I sell to a customer on account instead of cash?", "a": "Add the customer under Customers first. In the POS, search for their account, choose \"Account\" as the payment method, and the sale is billed to them instead of taking cash. Settle it later from Customers → Receive payment." },
+    { "topic": "customers", "video": "04-customers-and-accounts", "q": "How do loyalty points work?", "a": "A customer linked to a sale earns points on the total automatically. At a later sale, choose how many points to redeem and their value is taken off the bill. The rates are set in Settings." },
+    { "topic": "stock", "video": "05-stock-transfers", "q": "How do I send stock to another location or branch?", "a": "Open Transfers → New transfer, pick the destination location and the medicines to send. The stock leaves this location at once (oldest batch first); mark it received once the other side confirms it arrived." },
+    { "topic": "stock", "video": "06-departments-and-issues", "q": "How do I issue stock to a hospital ward or department?", "a": "Departments send a requisition from Issues → New request, or you can issue directly. Open the request and issue against it; each line tracks how much of what was requested has actually gone out." },
+    { "topic": "hr", "video": "07-employees-and-appointments", "q": "How do I add a staff member's employee record?", "a": "Open Employees → New employee. You can link it to their sign-in account so their role and activity line up, or keep a record for someone without a login at all." },
+    { "topic": "hr", "video": "07-employees-and-appointments", "q": "Can I book appointments or shifts on a calendar?", "a": "Yes, under Appointments. Everyone can manage their own; a user with the calendar permission can see and book for everyone else too, useful for building the week's roster." },
+    { "topic": "collaboration", "video": "08-messages-knowledge-roles", "q": "Can staff message each other inside the app?", "a": "Yes, under Messages: pick a co-worker and send a direct message. It is a simple inbox, not a broadcast channel, so it is easy to see every conversation." },
+    { "topic": "collaboration", "video": "08-messages-knowledge-roles", "q": "Where do I write down a procedure so the whole team can find it?", "a": "The Knowledge screen is a simple shared wiki: write an article, tag it, and anyone signed in can search and read it. Only staff with the knowledge permission can write or edit one." },
+    { "topic": "setup", "video": "08-messages-knowledge-roles", "q": "The built-in roles (admin, pharmacist, cashier) don't quite fit. Can I make my own?", "a": "Yes. Open Roles → New role, tick exactly the permissions that role should have, and assign it to a user from Users. A custom role's menu shows only the screens its permissions unlock." },
+    { "topic": "reports", "video": "09-reports-and-analytics", "q": "Where do I see today's sales total or this month's profit?", "a": "Reports has the sales summary, best sellers, low stock and expiry lists. Analytics turns the same numbers into charts over any date range you choose, including a payment-method breakdown." },
+    { "topic": "assistant", "video": "10-ai-assistant", "q": "Is it safe to let the assistant make changes?", "a": "The assistant only looks things up on its own. Any change it proposes — like setting a price or recording a payment — shows as a card with the full details, and nothing is saved until you click Approve. It can only do what your role already allows." },
+    { "topic": "assistant", "video": "10-ai-assistant", "q": "Can the assistant show me how to do something instead of just telling me?", "a": "Yes — ask it things like \"how do I make a sale\" or \"how do stock transfers work\" and, alongside its answer, it links straight to the matching tutorial video on this page." }
+  ]
+}

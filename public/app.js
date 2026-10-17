@@ -413,6 +413,7 @@ const ROUTES = [
   { path: 'appointments', label: 'Appointments', view: appointmentsView },
   { path: 'messages', label: 'Messages', view: messagesView },
   { path: 'knowledge', label: 'Knowledge', view: knowledgeView },
+  { path: 'help', label: 'Help & tutorials', view: helpView },
   { path: 'users', label: 'Users', view: usersView, perm: 'users.manage' },
   { path: 'roles', label: 'Roles', view: rolesView, perm: 'users.manage' },
   { path: 'owner', label: 'Owner', view: ownerView, ownerOnly: true },
@@ -2859,6 +2860,98 @@ function articleForm(a, onSaved, canManage) {
   } else {
     $('#kf', m.el).addEventListener('submit', (e) => e.preventDefault())
   }
+}
+
+// ---------- help, tutorials & FAQ ----------
+
+// Narrated tutorial videos, recorded by tools/tutorials and published to public/tutorials/<lang>/<id>.{mp4,jpg}.
+// The app's screens are English-only; only the narration (and caption) changes with the language.
+// Catalogue (tutorials, FAQ) lives in /tutorials.json, the single source the AI assistant's
+// find_tutorial tool reads too, so the two never drift apart.
+let tutorialsCataloguePromise = null
+const loadTutorialsCatalogue = () => tutorialsCataloguePromise ??= fetch('/tutorials.json').then((r) => r.json())
+const tutorialSrc = (lang, id, ext) => `/tutorials/${lang}/${id}.${ext}`
+
+async function helpView(view) {
+  const { tutorials: TUTORIALS, faq: FAQ, faq_topics: FAQ_TOPICS } = await loadTutorialsCatalogue()
+  let tab = hashParam('tab') === 'faq' ? 'faq' : 'videos'
+  let lang = (() => { try { return localStorage.getItem('pos.help.lang') } catch { return null } })() === 'ur' ? 'ur' : 'en'
+  let playing = TUTORIALS.some((t) => t.id === hashParam('v')) ? hashParam('v') : TUTORIALS[0].id
+  if (TUTORIALS.some((t) => t.id === hashParam('v')) && (hashParam('lang') === 'ur' || hashParam('lang') === 'en')) lang = hashParam('lang')
+
+  const render = () => {
+    view.innerHTML = `<div class="stack">
+      <div class="row"><h1>Help & tutorials</h1><div class="spacer"></div>
+        <div class="lang-switch" role="group" aria-label="Narration language">
+          <button type="button" data-lang="en" class="${lang === 'en' ? 'active' : ''}">English</button>
+          <button type="button" data-lang="ur" class="${lang === 'ur' ? 'active' : ''}">اردو</button>
+        </div></div>
+      <div class="row" role="tablist">
+        <button type="button" class="tab ${tab === 'videos' ? 'active' : ''}" data-tab="videos">Tutorials</button>
+        <button type="button" class="tab ${tab === 'faq' ? 'active' : ''}" data-tab="faq">FAQ</button>
+      </div>
+      <div id="help-body"></div>
+    </div>`
+    $$('.lang-switch button', view).forEach((b) => b.addEventListener('click', guard(() => { lang = b.dataset.lang; try { localStorage.setItem('pos.help.lang', lang) } catch {} render() })))
+    $$('.tab', view).forEach((b) => b.addEventListener('click', guard(() => { tab = b.dataset.tab; render() })))
+    if (tab === 'videos') renderVideos(); else renderFaq()
+  }
+
+  const renderVideos = () => {
+    const current = TUTORIALS.find((t) => t.id === playing)
+    $('#help-body', view).innerHTML = `
+      <div class="panel help-player">
+        <video controls preload="metadata" poster="${esc(tutorialSrc(lang, playing, 'jpg'))}" src="${esc(tutorialSrc(lang, playing, 'mp4'))}"></video>
+        <div class="help-caption"><strong>${esc(current.title)}</strong><span class="muted">${esc(current.summary)}</span></div>
+      </div>
+      <div class="help-grid">${TUTORIALS.map((t, i) => `
+        <button type="button" class="help-item ${t.id === playing ? 'active' : ''}" data-id="${t.id}">
+          <img src="${esc(tutorialSrc(lang, t.id, 'jpg'))}" alt="" loading="lazy">
+          <span class="help-item-text"><strong>${i + 1}. ${esc(t.title)}</strong><span class="muted small">${esc(t.summary)}</span></span>
+        </button>`).join('')}</div>`
+    $$('.help-item', view).forEach((b) => b.addEventListener('click', guard(() => {
+      playing = b.dataset.id
+      location.hash = `#/help?v=${playing}&lang=${lang}`
+      renderVideos()
+      $('video', view).play().catch(() => {})
+      view.scrollIntoView({ behavior: 'smooth' })
+    })))
+  }
+
+  const renderFaq = () => {
+    let q = ''
+    let topicFilter = ''
+    const list = () => {
+      const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean)
+      return FAQ.filter((f) => (!topicFilter || f.topic === topicFilter) && words.every((w) => `${f.q} ${f.a}`.toLowerCase().includes(w)))
+    }
+    const draw = () => {
+      const items = list()
+      $('#faq-list', view).innerHTML = items.length === 0 ? '<p class="muted">No questions match your search.</p>' : items.map((f, i) => `
+        <div class="faq-item"><button type="button" class="faq-q" data-i="${i}" aria-expanded="false"><span>${esc(f.q)}</span></button>
+          <div class="faq-a" hidden><p>${esc(f.a)}</p>${f.video ? `<button type="button" class="btn-link" data-watch="${f.video}">Watch the video: ${esc(TUTORIALS.find((t) => t.id === f.video)?.title || '')}</button>` : ''}</div></div>`).join('')
+      $$('.faq-q', view).forEach((b) => b.addEventListener('click', guard(() => {
+        const a = b.nextElementSibling
+        const open = !a.hidden
+        a.hidden = open
+        b.setAttribute('aria-expanded', String(!open))
+      })))
+      $$('[data-watch]', view).forEach((b) => b.addEventListener('click', guard(() => {
+        tab = 'videos'; playing = b.dataset.watch
+        location.hash = `#/help?v=${playing}&lang=${lang}`
+        render()
+      })))
+    }
+    $('#help-body', view).innerHTML = `<div class="stack">
+      <div class="row"><input id="faq-search" placeholder="Search questions…" style="max-width:320px">
+        <select id="faq-topic"><option value="">All topics</option>${FAQ_TOPICS.map((t) => `<option value="${t.value}">${esc(t.label)}</option>`).join('')}</select></div>
+      <div class="panel" id="faq-list"></div></div>`
+    $('#faq-search', view).addEventListener('input', guard((e) => { q = e.target.value; draw() }))
+    $('#faq-topic', view).addEventListener('change', guard((e) => { topicFilter = e.target.value; draw() }))
+    draw()
+  }
+
+  render()
 }
 
 // ---------- analytics (BI dashboards) ----------

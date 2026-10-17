@@ -47,6 +47,7 @@
 .as-msg p:last-child { margin-bottom: 0; }
 .as-msg ul { margin: 4px 0; padding-inline-start: 20px; }
 .as-msg code { font-size: 13px; background: var(--bg); padding: 0 4px; border-radius: 4px; }
+.as-msg a { color: inherit; font-weight: 600; text-decoration: underline; }
 .as-msg.me { align-self: flex-end; background: var(--accent); color: var(--accent-ink); white-space: pre-wrap; }
 .as-msg.bot { align-self: flex-start; background: var(--bg); border: 1px solid var(--border); }
 .as-msg.err { align-self: stretch; max-width: none; background: var(--danger-soft); color: var(--danger); }

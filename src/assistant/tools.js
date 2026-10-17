@@ -2,6 +2,8 @@
 // user (see internal.js), so route validation and role checks always apply. Money in tool inputs and
 // outputs is rupees (the API itself uses paisa).
 // kind 'read' runs automatically; kind 'write' changes data and only runs after the user approves.
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { HttpError } from '../lib/http.js'
 import { today } from '../db.js'
 
@@ -125,8 +127,44 @@ const productView = (p, { cost = false } = {}) => ({
   }),
 })
 
+// ── Help & tutorials (shared with the Help page's /tutorials.json, so they never drift apart) ────
+let TUTORIALS_CATALOGUE
+function tutorialsCatalogue() {
+  if (!TUTORIALS_CATALOGUE) {
+    const path = fileURLToPath(new URL('../../public/tutorials.json', import.meta.url))
+    TUTORIALS_CATALOGUE = JSON.parse(readFileSync(path, 'utf8'))
+  }
+  return TUTORIALS_CATALOGUE
+}
+const STOPWORDS = new Set(['how', 'do', 'i', 'the', 'a', 'an', 'to', 'is', 'are', 'can', 'for', 'of', 'in', 'on', 'and', 'what', 'where', 'does', 'it', 'me', 'my'])
+const words = (s) => String(s || '').toLowerCase().match(/[a-z0-9]+/g)?.filter((w) => !STOPWORDS.has(w)) || []
+function score(queryWords, text) {
+  const textWords = new Set(words(text))
+  return queryWords.filter((w) => textWords.has(w)).length
+}
+
 // ── Tool definitions ───────────────────────────────────────────────────────
 export const TOOLS = [
+  {
+    name: 'find_tutorial', kind: 'read', roles: ALL, label: 'Looked up a tutorial',
+    description: 'Find the narrated tutorial video and/or FAQ answer that best matches a question about using this software (e.g. "how do I make a sale", "how do stock transfers work"). Always use this before answering a how-do-I-use-the-software question, and include the returned link in your reply so the user can open or watch it.',
+    input_schema: obj({ query: str('What the user is asking about, in their own words') }, ['query']),
+    async run({ query }) {
+      const catalogue = tutorialsCatalogue()
+      const qWords = words(query)
+      const videoTitle = new Map(catalogue.tutorials.map((t) => [t.id, t.title]))
+      const videos = catalogue.tutorials
+        .map((t) => ({ t, s: score(qWords, `${t.title} ${t.summary}`) }))
+        .filter((x) => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 3)
+        .map(({ t }) => ({ title: t.title, summary: t.summary, link: `#/help?v=${t.id}&lang=en` }))
+      const faqs = catalogue.faq
+        .map((f) => ({ f, s: score(qWords, `${f.q} ${f.a}`) }))
+        .filter((x) => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 3)
+        .map(({ f }) => ({ question: f.q, answer: f.a, video_title: f.video ? videoTitle.get(f.video) : undefined, link: f.video ? `#/help?v=${f.video}&lang=en` : '#/help?tab=faq' }))
+      if (!videos.length && !faqs.length) return { found: false, message: 'No matching tutorial yet; answer from what you know and point to Help & tutorials in the menu.', browse_link: '#/help' }
+      return { found: true, videos, faqs, note: 'Show the user the link(s) as a clickable [title](link) in your reply.' }
+    },
+  },
   {
     name: 'search_products', kind: 'read', roles: ALL, label: 'Searched medicines',
     description: 'Find medicines by name, generic name or item code. Returns stock (sellable, unexpired), current pack price, next expiry and schedule (otc/rx/controlled).',
